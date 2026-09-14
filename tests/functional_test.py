@@ -6,6 +6,8 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from paper_search_mcp.config import get_env
+
 QUERY = "machine learning"
 MAX_RESULTS = 3
 results = {}
@@ -58,9 +60,19 @@ from paper_search_mcp.academic_platforms.medrxiv import MedRxivSearcher
 test_platform("medrxiv.search", lambda: MedRxivSearcher().search("infectious_diseases", max_results=MAX_RESULTS, days=30))
 
 # ── Google Scholar ────────────────────────────────────────────────────────────
-print("\n[5] Google Scholar  (may be blocked by bot-detection)")
+print("\n[5] Google Scholar via SerpAPI")
 from paper_search_mcp.academic_platforms.google_scholar import GoogleScholarSearcher
-test_platform("google_scholar.search", lambda: GoogleScholarSearcher().search(QUERY, max_results=MAX_RESULTS), optional=True)
+if get_env("SERPAPI_API_KEY").strip():
+    test_platform("google_scholar.search", lambda: GoogleScholarSearcher().search(QUERY, max_results=MAX_RESULTS))
+else:
+    print("  [SKIP] Set PAPER_SEARCH_MCP_SERPAPI_API_KEY to test Google Scholar")
+
+print("\n[Scopus] Elsevier API")
+from paper_search_mcp.academic_platforms.scopus import ScopusSearcher
+if get_env("SCOPUS_API_KEY").strip():
+    test_platform("scopus.search", lambda: ScopusSearcher().search(QUERY, max_results=MAX_RESULTS))
+else:
+    print("  [SKIP] Set PAPER_SEARCH_MCP_SCOPUS_API_KEY to test Scopus")
 
 # ── IACR ─────────────────────────────────────────────────────────────────────
 print("\n[6] IACR  (fetch_details=False for speed)")

@@ -15,6 +15,7 @@ from .academic_platforms.pubmed import PubMedSearcher
 from .academic_platforms.biorxiv import BioRxivSearcher
 from .academic_platforms.medrxiv import MedRxivSearcher
 from .academic_platforms.google_scholar import GoogleScholarSearcher
+from .academic_platforms.scopus import ScopusSearcher
 from .academic_platforms.iacr import IACRSearcher
 from .academic_platforms.semantic import SemanticSearcher
 from .academic_platforms.crossref import CrossRefSearcher
@@ -48,7 +49,6 @@ def _init_searchers() -> None:
     SEARCHERS["pubmed"] = PubMedSearcher()
     SEARCHERS["biorxiv"] = BioRxivSearcher()
     SEARCHERS["medrxiv"] = MedRxivSearcher()
-    SEARCHERS["google_scholar"] = GoogleScholarSearcher()
     SEARCHERS["iacr"] = IACRSearcher()
     SEARCHERS["semantic"] = SemanticSearcher()
     SEARCHERS["crossref"] = CrossRefSearcher()
@@ -67,6 +67,11 @@ def _init_searchers() -> None:
     SEARCHERS["hal"] = HALSearcher()
     SEARCHERS["ssrn"] = SSRNSearcher()
 
+    if key := get_env("SERPAPI_API_KEY").strip():
+        SEARCHERS["google_scholar"] = GoogleScholarSearcher(api_key=key)
+    if key := get_env("SCOPUS_API_KEY").strip():
+        SEARCHERS["scopus"] = ScopusSearcher(api_key=key)
+
     # Optional paid connectors
     ieee_key = get_env("IEEE_API_KEY", "")
     if ieee_key:
@@ -79,17 +84,9 @@ def _init_searchers() -> None:
         SEARCHERS["acm"] = ACMSearcher()
 
 
-ALL_SOURCES = [
-    "arxiv", "pubmed", "biorxiv", "medrxiv", "google_scholar", "iacr",
-    "semantic", "crossref", "openalex", "pmc", "core", "europepmc",
-    "dblp", "openaire", "citeseerx", "doaj", "base", "zenodo", "hal",
-    "ssrn", "unpaywall",
-]
-
-
 def _parse_sources(sources: str) -> List[str]:
     if not sources or sources.strip().lower() == "all":
-        return [s for s in ALL_SOURCES if s in SEARCHERS]
+        return list(SEARCHERS)
     normalized = [p.strip().lower() for p in sources.split(",") if p.strip()]
     return [s for s in normalized if s in SEARCHERS]
 

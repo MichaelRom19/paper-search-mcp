@@ -12,6 +12,7 @@ from .academic_platforms.pubmed import PubMedSearcher
 from .academic_platforms.biorxiv import BioRxivSearcher
 from .academic_platforms.medrxiv import MedRxivSearcher
 from .academic_platforms.google_scholar import GoogleScholarSearcher
+from .academic_platforms.scopus import ScopusSearcher
 from .academic_platforms.iacr import IACRSearcher
 from .academic_platforms.semantic import SemanticSearcher
 from .academic_platforms.crossref import CrossRefSearcher
@@ -43,7 +44,6 @@ arxiv_searcher = ArxivSearcher()
 pubmed_searcher = PubMedSearcher()
 biorxiv_searcher = BioRxivSearcher()
 medrxiv_searcher = MedRxivSearcher()
-google_scholar_searcher = GoogleScholarSearcher()
 iacr_searcher = IACRSearcher()
 semantic_searcher = SemanticSearcher()
 crossref_searcher = CrossRefSearcher()
@@ -81,7 +81,6 @@ ALL_SOURCES = [
     "pubmed",
     "biorxiv",
     "medrxiv",
-    "google_scholar",
     "iacr",
     "semantic",
     "crossref",
@@ -124,6 +123,15 @@ if _acm_api_key:
     logger.info("ACM Digital Library enabled via configured environment key.")
 else:
     acm_searcher = None
+
+
+_serpapi_key = get_env("SERPAPI_API_KEY").strip()
+_scopus_key = get_env("SCOPUS_API_KEY").strip()
+google_scholar_searcher = GoogleScholarSearcher(api_key=_serpapi_key) if _serpapi_key else None
+scopus_searcher = ScopusSearcher(api_key=_scopus_key) if _scopus_key else None
+ALL_SOURCES.extend(name for name, searcher in (
+    ("google_scholar", google_scholar_searcher), ("scopus", scopus_searcher),
+) if searcher is not None)
 
 
 def _parse_sources(sources: str) -> List[str]:
@@ -252,7 +260,9 @@ async def search_papers(
         query: Search query string.
         max_results_per_source: Max results to fetch from each selected source.
         sources: Comma-separated source names or 'all'.
-            Available: arxiv,pubmed,biorxiv,medrxiv,google_scholar,iacr,semantic,crossref,openalex,pmc,core,europepmc,dblp,openaire,citeseerx,doaj,base,zenodo,hal,ssrn,unpaywall
+            Available: arxiv,pubmed,biorxiv,medrxiv,iacr,semantic,crossref,openalex,pmc,core,europepmc,dblp,openaire,citeseerx,doaj,base,zenodo,hal,ssrn,unpaywall.
+            With configured keys: google_scholar (SerpAPI), scopus, ieee, acm.
+            'all' includes configured Google Scholar and consumes SerpAPI searches.
         year: Optional year filter for Semantic Scholar only.
     Returns:
         Aggregated dictionary with per-source stats, errors, and deduplicated papers.
@@ -320,6 +330,9 @@ async def search_papers(
         elif source == "acm":
             if acm_searcher is not None:
                 task_map[source] = async_search(acm_searcher, query, max_results_per_source)
+        elif source == "scopus":
+            if scopus_searcher is not None:
+                task_map[source] = async_search(scopus_searcher, query, max_results_per_source)
 
     source_names = list(task_map.keys())
     source_outputs = await asyncio.gather(*task_map.values(), return_exceptions=True)
@@ -422,18 +435,23 @@ async def search_medrxiv(query: str, max_results: int = 10) -> List[Dict]:
     return papers if papers else []
 
 
-@mcp.tool()
 async def search_google_scholar(query: str, max_results: int = 10) -> List[Dict]:
-    """Search academic papers from Google Scholar.
+    """Search Google Scholar through SerpAPI. Requires PAPER_SEARCH_MCP_SERPAPI_API_KEY.
 
     Args:
         query: Search query string (e.g., 'machine learning').
         max_results: Maximum number of papers to return (default: 10).
     Returns:
-        List of paper metadata in dictionary format.
+        Paper metadata with citation counts and PDF links when available.
+        The abstract field contains a search snippet, not a full abstract.
     """
-    papers = await async_search(google_scholar_searcher, query, max_results)
-    return papers if papers else []
+    if google_scholar_searcher is None:
+        raise ValueError("Set PAPER_SEARCH_MCP_SERPAPI_API_KEY to enable Google Scholar.")
+    return await async_search(google_scholar_searcher, query, max_results)
+
+
+if google_scholar_searcher is not None:
+    mcp.tool()(search_google_scholar)
 
 
 @mcp.tool()
@@ -766,7 +784,7 @@ async def download_with_fallback(
     """Try source-native download, OA repositories, Unpaywall, then optional Sci-Hub.
 
     Args:
-        source: Source name (arxiv, biorxiv, medrxiv, iacr, semantic, crossref, pubmed, pmc, core, europepmc, citeseerx, doaj, base, zenodo, hal, ssrn).
+        source: Source name (arxiv, biorxiv, medrxiv, iacr, semantic, crossref, pubmed, pmc, core, europepmc, citeseerx, doaj, base, zenodo, hal, ssrn, scopus).
         paper_id: Source-native paper identifier.
         doi: Optional DOI used for repository/unpaywall/Sci-Hub fallback.
         title: Optional title used for repository/Sci-Hub fallback when DOI is unavailable.
@@ -796,6 +814,8 @@ async def download_with_fallback(
         "hal": hal_searcher.download_pdf,
         "ssrn": ssrn_searcher.download_pdf,
     }
+    if scopus_searcher is not None:
+        primary_downloaders["scopus"] = scopus_searcher.download_pdf
 
     attempt_errors: List[str] = []
     primary_error = ""
@@ -1374,6 +1394,41 @@ if acm_searcher is not None:
             str: Extracted text content.
         """
         return acm_searcher.read_paper(paper_id, save_path)
+
+
+if scopus_searcher is not None:
+    @mcp.tool()
+    async def search_scopus(query: str, max_results: int = 10, sort: str = "relevance",
+                            field: str | None = None, date: str | None = None) -> list[dict]:
+        """Search Scopus with PAPER_SEARCH_MCP_SCOPUS_API_KEY and subscriber entitlement.
+
+        query supports Scopus TITLE/ABS/KEY/AUTH/AFFILORG fields, Boolean and
+        proximity operators, and wildcards. field optionally wraps the query.
+        sort accepts relevance, coverDate, citedby-count, creator, and other
+        Scopus sort fields; prefix + for ascending or - for descending.
+        date accepts a year or range: 2024, 2020-2024, 2020-, or -2024.
+        Results use COMPLETE view, paginated in batches of at most 25.
+        """
+        return await async_search(scopus_searcher, query, max_results, sort=sort, field=field, date=date)
+
+    @mcp.tool()
+    async def read_scopus_paper(paper_id: str, save_path: str = "./downloads") -> str:
+        """Read entitled ScienceDirect full text for a numeric Scopus ID.
+
+        Returns metadata and full text, or a labeled abstract-only result when
+        full text is unavailable. SCOPUS_ID: prefixes are accepted.
+        Requires PAPER_SEARCH_MCP_SCOPUS_API_KEY. save_path is unused (no file is saved).
+        """
+        return await asyncio.to_thread(scopus_searcher.read_paper, paper_id, save_path)
+
+    @mcp.tool()
+    async def download_scopus(paper_id: str, save_path: str = "./downloads") -> str:
+        """Save an entitled ScienceDirect PDF as <numeric Scopus ID>.pdf.
+
+        Requires PAPER_SEARCH_MCP_SCOPUS_API_KEY and article entitlement.
+        Accepts numeric IDs with or without SCOPUS_ID:. Returns the saved path.
+        """
+        return await asyncio.to_thread(scopus_searcher.download_pdf, paper_id, save_path)
 
 
 def main():

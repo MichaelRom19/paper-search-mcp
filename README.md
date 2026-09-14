@@ -1,6 +1,6 @@
 # Paper Search MCP
 
-A Model Context Protocol (MCP) server for searching and downloading academic papers from multiple sources. The project follows a free-first strategy: prioritize open and public data sources, support optional API keys when they improve stability or coverage, and keep source-specific connectors extensible for advanced users.
+A Model Context Protocol (MCP) server and CLI for searching academic papers and retrieving available full text. Start with public sources and optionally enable Google Scholar through SerpAPI or Scopus with ScienceDirect retrieval. Download and read support varies by source and access rights.
 
 ![PyPI](https://img.shields.io/pypi/v/paper-search-mcp.svg) ![License](https://img.shields.io/badge/license-MIT-blue.svg) ![Python](https://img.shields.io/badge/python-3.10+-blue.svg)
 [![smithery badge](https://smithery.ai/badge/@openags/paper-search-mcp)](https://smithery.ai/server/@openags/paper-search-mcp)
@@ -13,11 +13,17 @@ A Model Context Protocol (MCP) server for searching and downloading academic pap
 - [Project Principles](#project-principles)
 - [Features](#features)
 - [Source Strategy](#source-strategy)
+- [Platform Capability Matrix](#platform-capability-matrix)
+- [Credential & API Key Requirements](#credential--api-key-requirements)
+- [Known Upstream Limitations](#known-upstream-limitations)
+- [Optional Platform Skeletons](#optional-platform-skeletons)
+- [Scopus and Google Scholar API Connectors](#scopus-and-google-scholar-api-connectors)
+- [Additional Repository and Discovery Sources](#additional-repository-and-discovery-sources)
 - [Sci-Hub Notice](#sci-hub-notice)
 - [Installation](#installation)
   - [Claude Code (Skill)](#claude-code-skill--recommended-for-claude-code-users)
   - [Method 1 — Smithery](#method-1--smithery-one-command-recommended-for-claude-desktop)
-  - [Method 2 — uvx](#method-2--uvx-no-install-always-latest)
+  - [Method 2 — uvx](#method-2--uvx-no-install)
   - [Method 3 — uv](#method-3--uv-persistent-install)
   - [Method 4 — pip](#method-4--pip-standard-python-install)
   - [Method 5 — npx](#method-5--npx-via-smithery-cli-no-local-python-needed)
@@ -25,6 +31,7 @@ A Model Context Protocol (MCP) server for searching and downloading academic pap
   - [Method 7 — Clone & run from source](#method-7--clone--run-from-source-development--recommended-for-macos-local)
   - [Environment Variables](#environment-variables-env-file)
 - [Contributing](#contributing)
+  - [Validation](#validation)
 - [Demo](#demo)
 - [Star History](#star-history)
 - [License](#license)
@@ -39,7 +46,7 @@ A Model Context Protocol (MCP) server for searching and downloading academic pap
 ## Project Principles
 
 - **Free-First**: Public and open sources are the default roadmap. Paid or restricted sources are not the core direction of this project.
-- **Optional API Keys**: API keys are supported only when they improve stability, rate limits, or metadata quality. The MCP should still be usable without them whenever possible.
+- **Optional Integrations**: The server and CLI work without API keys. Google Scholar requires a SerpAPI key, and Scopus requires an Elsevier key and applicable access rights; both connectors remain disabled until their keys are configured.
 - **LLM-Friendly Retrieval**: Search results should be standardized, deduplicated, and as complete as possible for downstream LLM workflows.
 - **Source Transparency**: Different sources have different strengths. The MCP should make those tradeoffs explicit instead of pretending every source supports full-text retrieval.
 
@@ -48,37 +55,31 @@ A Model Context Protocol (MCP) server for searching and downloading academic pap
 ## Features
 
 - **Two-Layer Architecture**:
-  - **Layer 1 (Unified Tooling)**: High-level `search_papers` for multi-source concurrent search & deduplication, and `download_with_fallback` relying on publisher open access links with sequential fallbacks.
+  - **Layer 1 (Unified Tooling)**: `search_papers` for concurrent search and deduplication, and `download_with_fallback` for source-native downloads followed by repository and DOI-based fallbacks.
   - **Layer 2 (Platform Connectors)**: Modular connectors for specific academic platforms (arXiv, PubMed, bioRxiv, Semantic Scholar, etc.) equipped with intelligent DOI extraction via regex text analysis or API fields.
-- **Multi-Source Support**: Search and download papers from arXiv, PubMed, bioRxiv, medRxiv, Google Scholar, IACR ePrint Archive, Semantic Scholar, Crossref, OpenAlex, PubMed Central (PMC), CORE, Europe PMC, dblp, OpenAIRE, CiteSeerX, DOAJ, BASE, Zenodo, HAL, SSRN, Unpaywall (DOI lookup), and optional Sci-Hub workflows.
+- **Multi-Source Discovery**: Search arXiv, PubMed, bioRxiv, medRxiv, Google Scholar (SerpAPI), Scopus, IACR ePrint Archive, Semantic Scholar, Crossref, OpenAlex, PubMed Central (PMC), CORE, Europe PMC, dblp, OpenAIRE, CiteSeerX, DOAJ, BASE, Zenodo, HAL, SSRN, and Unpaywall (DOI lookup). ScienceDirect provides retrieval for Scopus records and is not a separate search source.
 - **Standardized Output**: Papers are returned in a consistent dictionary format via the `Paper` class.
-- **Free-First Design**: Open and public sources are prioritized before any optional commercial or restricted integrations.
-- **Optional API-Key Enhancement**: Sources like Semantic Scholar can work better with a user-provided API key, but are not intended to force paid usage.
+- **Configured Sources in Both Interfaces**: MCP `sources="all"` and CLI `--sources all` include Google Scholar and Scopus automatically when configured. Selected sources are searched concurrently; `all` does not defer paid services until public searches fail.
+- **Optional API-Key Enhancement**: Sources like Semantic Scholar can work without a key; a key can improve their rate limits. Other sources require credentials as listed below.
 - **Discovery + Retrieval Workflow**: Google Scholar and Crossref can be used for discovery and DOI backfilling, while open repositories and publisher links are used for lawful full-text resolution where available.
-- **OA-First Fallback Chain**: `download_with_fallback` now follows source-native download → OpenAIRE/CORE/Europe PMC/PMC discovery → Unpaywall DOI resolution → optional Sci-Hub.
+- **Download Fallback Chain**: `download_with_fallback` tries source-native download (including configured Scopus) → OpenAIRE/CORE/Europe PMC/PMC discovery → Unpaywall DOI resolution → Sci-Hub when `use_scihub=True` (the current default). Set `use_scihub=False` to stop after the open-access fallbacks.
 - **MCP Integration**: Compatible with MCP clients for LLM context enhancement.
 - **Extensible Design**: Easily add new academic platforms by extending the `academic_platforms` module.
 
 ## Source Strategy
 
-The long-term goal is not to depend on a single search engine, but to combine multiple free and public sources with clear roles:
+The connectors combine public metadata, open repositories, and optional services with different roles:
 
 - **Open metadata backbone**: Crossref, OpenAlex, Semantic Scholar, dblp, CiteSeerX, SSRN, Unpaywall (DOI-centric OA metadata).
 - **Discipline-specific sources**: arXiv, PubMed, PubMed Central, Europe PMC, IACR.
 - **Open-access full-text sources**: arXiv, PMC, CORE, OpenAIRE, DOAJ, BASE, Zenodo, HAL, publisher open-access links.
-- **Discovery and DOI recovery**: Google Scholar can be useful for finding titles, versions, and DOI clues when other public metadata sources are incomplete.
+- **Additional discovery**: Google Scholar via SerpAPI provides result metadata, snippets, DOI clues, and available PDF links. Scopus provides indexed metadata and citation counts; ScienceDirect supplies available article text and PDFs for Scopus records.
 
-Recommended free-first roadmap:
-
-1. Keep current public sources stable.
-2. Add OpenAlex as a broad free metadata source.
-3. Add PubMed Central and Europe PMC for stronger biomedical full-text access.
-4. Add CORE and OpenAIRE for repository-based open-access retrieval.
-5. Use Google Scholar mainly as a discovery fallback, not as the primary canonical source.
+OpenAlex, PubMed Central, Europe PMC, CORE, and OpenAIRE are already integrated. Choose an explicit source list to control which providers receive a query; `all` searches every configured source and can consume SerpAPI credits and Elsevier quota.
 
 ## Platform Capability Matrix
 
-This matrix reflects **verified live-integration results** from functional and end-to-end regression tests in this repository. Columns show the highest capability level observed under normal conditions.
+This matrix describes implemented capabilities and known access restrictions. Check marks indicate implemented connector support, not guaranteed access to every record. Google Scholar (SerpAPI) and Scopus/ScienceDirect have mocked API tests; live API access and Elsevier entitlements were not verified for these integrations.
 
 | Platform | Search | Download | Read | Notes |
 |---|---|---|---|---|
@@ -86,7 +87,7 @@ This matrix reflects **verified live-integration results** from functional and e
 | PubMed | ✅ | ❌ | ⚠️ info-only | Open API; reliable |
 | bioRxiv | ✅ | ✅ | ✅ | Open API; reliable |
 | medRxiv | ✅ | ✅ | ✅ | Open API; reliable |
-| Google Scholar | ⚠️ | ❌ | ❌ | Bot-detection active; set `PAPER_SEARCH_MCP_GOOGLE_SCHOLAR_PROXY_URL` |
+| Google Scholar 🔑 | ✅ | ❌ | ❌ | Requires `PAPER_SEARCH_MCP_SERPAPI_API_KEY`; abstracts are search snippets; includes PDF links when available |
 | IACR | ✅ | ✅ | ✅ | Open API; reliable |
 | Semantic Scholar | ✅ | ✅ (OA) | ✅ (OA) | Works without key (rate-limited); key improves limits; key rejection (403) retried automatically without key |
 | Crossref | ✅ | ❌ | ⚠️ info-only | Open API; reliable |
@@ -106,27 +107,30 @@ This matrix reflects **verified live-integration results** from functional and e
 | Sci-Hub (optional) | ⚠️ fallback-only | ✅ | ❌ | Optional; unstable mirrors; user responsibility |
 | **IEEE Xplore** 🔑 | 🚧 skeleton | 🚧 skeleton | 🚧 skeleton | Requires `PAPER_SEARCH_MCP_IEEE_API_KEY` to activate |
 | **ACM DL** 🔑 | 🚧 skeleton | 🚧 skeleton | 🚧 skeleton | Requires `PAPER_SEARCH_MCP_ACM_API_KEY` to activate |
+| **Scopus** 🔑 | ✅ (access-dependent) | ⚠️ entitlement | ⚠️ full text / abstract | Requires `PAPER_SEARCH_MCP_SCOPUS_API_KEY` and access to COMPLETE-view search; ScienceDirect retrieval depends on article availability and entitlement |
 
-> ✅ = reliable in live tests.  ⚠️ = works but subject to upstream instability or access restrictions.  ❌ = not supported.  🔑 = key required.  🚧 = skeleton only.
+> ✅ = implemented.  ⚠️ = limited or dependent on upstream availability/access.  ❌ = not supported.  🔑 = key required.  🚧 = skeleton only.
 
 ---
 
 ## Credential & API Key Requirements
 
-All keys are **optional** unless noted. Configure them in `~/.config/paper-search-mcp/.env` (preferred) or as shell exports.
+No credentials are required to start the server or CLI. Credentials marked **required to activate** enable individual connectors; configuring a key does not grant provider subscriptions or institutional access. Set credentials in `~/.config/paper-search-mcp/.env` (preferred) or as shell exports.
 
 | Environment Variable | Provider | Required? | How to obtain |
 |---|---|---|---|
-| `PAPER_SEARCH_MCP_UNPAYWALL_EMAIL` | Unpaywall | **Yes** (Unpaywall disabled without it) | Any valid email; register at [unpaywall.org](https://unpaywall.org/products/api) |
+| `PAPER_SEARCH_MCP_UNPAYWALL_EMAIL` | Unpaywall | **Required for lookup** (returns no results without it) | Any valid contact email; see [Unpaywall API](https://unpaywall.org/products/api) |
 | `PAPER_SEARCH_MCP_CORE_API_KEY` | CORE | Recommended | Free at [core.ac.uk/services/api](https://core.ac.uk/services/api) |
 | `PAPER_SEARCH_MCP_SEMANTIC_SCHOLAR_API_KEY` | Semantic Scholar | Optional | Free at [semanticscholar.org](https://www.semanticscholar.org/product/api) — improves rate limits |
-| `PAPER_SEARCH_MCP_GOOGLE_SCHOLAR_PROXY_URL` | Google Scholar | Optional | Your HTTP/HTTPS proxy URL — bypasses bot-detection |
+| `PAPER_SEARCH_MCP_SERPAPI_API_KEY` | Google Scholar via SerpAPI | **Required to activate** | [SerpAPI API key](https://serpapi.com/manage-api-key); requests use your account's search allowance |
 | `PAPER_SEARCH_MCP_DOAJ_API_KEY` | DOAJ | Optional | Free at [doaj.org](https://doaj.org/apply-for-api-key/) — raises hourly rate limit |
 | `PAPER_SEARCH_MCP_ZENODO_ACCESS_TOKEN` | Zenodo | Optional | Free at [zenodo.org](https://zenodo.org/account/settings/applications/) — required for private records |
 | `PAPER_SEARCH_MCP_IEEE_API_KEY` | IEEE Xplore | **Required to activate** | Free at [developer.ieee.org](https://developer.ieee.org/) |
 | `PAPER_SEARCH_MCP_ACM_API_KEY` | ACM DL | **Required to activate** | See [libraries.acm.org/digital-library/acm-open](https://libraries.acm.org/digital-library/acm-open) |
+| `PAPER_SEARCH_MCP_SCOPUS_API_KEY` | Scopus / ScienceDirect | **Required to activate** | [Elsevier Developer Portal](https://dev.elsevier.com/); COMPLETE-view search and retrieval require applicable access rights |
+| `PAPER_SEARCH_MCP_SCOPUS_INST_TOKEN` | Scopus / ScienceDirect | Optional; API key still required | [Elsevier institutional authentication](https://dev.elsevier.com/tecdoc_api_authentication.html); otherwise institutional network/VPN access may be needed |
 
-All variables follow the `PAPER_SEARCH_MCP_<NAME>` prefix scheme. Legacy names without the prefix (e.g. `CORE_API_KEY`, `UNPAYWALL_EMAIL`) are still supported for backward compatibility.
+All variables follow the `PAPER_SEARCH_MCP_<NAME>` prefix scheme. Legacy names without the prefix (e.g. `CORE_API_KEY`, `UNPAYWALL_EMAIL`) are still supported for backward compatibility. A present prefixed value takes precedence, including an empty value; remove it to use the unprefixed alias.
 
 ---
 
@@ -136,7 +140,8 @@ Some search failures are caused by external provider instability, not by bugs in
 
 | Source | Symptom | Cause | Workaround |
 |---|---|---|---|
-| Google Scholar | Returns 0 results / empty HTML | Bot-detection (CAPTCHA) | Set `PAPER_SEARCH_MCP_GOOGLE_SCHOLAR_PROXY_URL` to a proxy |
+| Google Scholar | Source/tool absent, or API authentication/quota error | No key disables the connector; invalid keys and exhausted quotas fail requests | Configure `PAPER_SEARCH_MCP_SERPAPI_API_KEY`, restart the server, and check SerpAPI usage; genuine empty searches return an empty list |
+| Scopus / ScienceDirect | Source/tool absent, 401/403, abstract-only read, or unavailable PDF | Missing key, insufficient API access, entitlement, or article availability | Configure the Elsevier key and restart; verify COMPLETE-view search access and institutional network/VPN or token. Scopus coverage does not guarantee ScienceDirect full text |
 | Semantic Scholar | 429 rate-limited responses | Anonymous access rate limit | Set `PAPER_SEARCH_MCP_SEMANTIC_SCHOLAR_API_KEY`; if key is rejected (403) connector automatically retries without key |
 | CORE | 500 / timeout errors | Unauthenticated rate limiting | Set `PAPER_SEARCH_MCP_CORE_API_KEY` (free); connector retries with exponential backoff and falls back to key-less on 401/403 |
 | OpenAIRE | Transient 403 responses | IP-based session rate limiting | Connector retries 3× per profile, escalating: plain session → XML Accept header → raw `requests.get` with Mozilla UA |
@@ -144,9 +149,9 @@ Some search failures are caused by external provider instability, not by bugs in
 | BASE | Search returns 0 results | OAI-PMH endpoint requires institutional IP registration | Register at [base-search.net](https://www.base-search.net/about/en/) for API access; connector returns empty gracefully otherwise |
 | SSRN | HTTP 403 | Bot-detection (Cloudflare) | No workaround; connector tries two endpoints and returns a clear message on failure |
 | PMC / Europe PMC | PDF download ProxyError | Local proxy blocking direct HTTPS PDF download | Disable proxy or use `download_with_fallback` instead |
-| Unpaywall | Skipped entirely | `UNPAYWALL_EMAIL` env var not set | Set `PAPER_SEARCH_MCP_UNPAYWALL_EMAIL` in `~/.config/paper-search-mcp/.env` |
+| Unpaywall | Lookup returns no results without making an API request | Email not configured | Set `PAPER_SEARCH_MCP_UNPAYWALL_EMAIL` in `~/.config/paper-search-mcp/.env` |
 
-## Optional Paid Platform Connectors (Phase 3)
+## Optional Platform Skeletons
 
 IEEE Xplore and ACM Digital Library connectors are included as **opt-in skeletons**.
 They are **disabled by default** — no API calls are made unless you explicitly configure the corresponding keys.
@@ -159,17 +164,59 @@ They are **disabled by default** — no API calls are made unless you explicitly
 **How to enable:**
 
 ```bash
-export PAPER_SEARCH_MCP_IEEE_API_KEY=<your_ieee_key>       # free key at https://developer.ieee.org/
-export PAPER_SEARCH_MCP_ACM_API_KEY=<your_acm_key>         # see https://libraries.acm.org/digital-library
+export PAPER_SEARCH_MCP_IEEE_API_KEY=your_ieee_key
+export PAPER_SEARCH_MCP_ACM_API_KEY=your_acm_key
 ```
 
-Once a key is set, the corresponding source is automatically added to `ALL_SOURCES` and its MCP tools (`search_ieee` / `search_acm`, `download_ieee` / `download_acm`, `read_ieee_paper` / `read_acm_paper`) are registered at server startup.
+Once a key is set, the corresponding source is automatically included in MCP and CLI `all` searches. Its MCP tools (`search_ieee` / `search_acm`, `download_ieee` / `download_acm`, `read_ieee_paper` / `read_acm_paper`) are registered at server startup.
 
-Without a key the connectors log a startup warning only — the rest of the server is unaffected.
+Without a key these connectors are not initialized or registered.
 
-## Free Source Expansion (Phase 4)
+## Scopus and Google Scholar API Connectors
 
-Three additional free-source connectors are now integrated into the MCP server:
+Configure either or both keys in `~/.config/paper-search-mcp/.env`, then restart the MCP server. CLI commands read the configuration when they start:
+
+```dotenv
+PAPER_SEARCH_MCP_SCOPUS_API_KEY=your_elsevier_key
+PAPER_SEARCH_MCP_SERPAPI_API_KEY=your_serpapi_key
+# Optional alternative to institutional IP authentication:
+# PAPER_SEARCH_MCP_SCOPUS_INST_TOKEN=your_institution_token
+```
+
+Unprefixed `SCOPUS_API_KEY`, `SERPAPI_API_KEY`, and `SCOPUS_INST_TOKEN` are also accepted. Each source and its MCP tools are enabled only when its API key is nonempty. Setting the institutional token alone does not enable Scopus.
+
+| Source name | MCP tools registered when configured |
+|---|---|
+| `google_scholar` | `search_google_scholar` |
+| `scopus` | `search_scopus`, `read_scopus_paper`, `download_scopus` |
+
+Run `paper-search sources` to inspect the CLI's available sources. MCP `search_papers(..., sources="all")` and CLI `--sources all` include configured connectors automatically. The unified search defaults to five results **per source**; the dedicated Scopus and Scholar search tools default to ten. Larger limits can require multiple requests. SerpAPI's default caching remains enabled, but an `all` search can still consume account credits. Select explicit sources to control usage.
+
+**Scopus / ScienceDirect:** `search_scopus(query, max_results=10, sort="relevance", field=None, date=None)` supports advanced Scopus queries. `field` optionally wraps the query, for example `field="TITLE-ABS-KEY"`. Sort options include `relevance` (translated to Elsevier's `relevancy`), `-citedby-count`, and `-coverDate`. Dates accept a single year or closed/open ranges such as `2024`, `2020-2024`, `2020-`, and `-2024`. Results use COMPLETE view and paginate in batches of up to 25; an API key alone may not authorize that view. The unified MCP `year` parameter and CLI `--year` option apply only to Semantic Scholar. Scopus-specific `field`, `date`, and `sort` options are exposed by the dedicated MCP tool and Python connector.
+
+`read_scopus_paper(paper_id, save_path="./downloads")` retrieves Scopus metadata and an abstract, then requests native ScienceDirect article text directly by Scopus ID. If metadata retrieval succeeds but article access returns 403/404 or no full-text body, it returns a labeled **ABSTRACT ONLY** result with the reason. Metadata failures, exhausted quotas, malformed responses, and service failures remain errors. Reading returns text without saving a file; `save_path` is retained for interface compatibility.
+
+`download_scopus(paper_id, save_path="./downloads")` requests a PDF through the same Article Retrieval API, validates it before writing, and saves `<numeric Scopus ID>.pdf`. It fails when a PDF is unavailable; it does not save abstract text as a PDF. Both read and download accept numeric IDs with or without `SCOPUS_ID:`. ScienceDirect is the retrieval backend, not a separate search source. Institutional access does not guarantee that every Scopus record has an accessible ScienceDirect article. MCP `download_with_fallback(source="scopus", ...)` can try repository and DOI-based alternatives after the native download fails; supply the paper's DOI or title for those lookups.
+
+```bash
+paper-search search 'TITLE("machine learning")' -s scopus -n 30
+# Replace this example ID with paper_id from a Scopus search result:
+paper-search read scopus 12345678900
+paper-search download scopus 12345678900 -o ./downloads
+paper-search search "machine learning" -s google_scholar -n 20
+```
+
+**Google Scholar:** `search_google_scholar(query, max_results=10)` uses [SerpAPI's Scholar API](https://serpapi.com/google-scholar-api), paginating up to 20 results per request. Results retain the existing `Paper` schema and `google_scholar` source name, with stable IDs, authors, publication year, citation counts, DOI extraction, publisher links, and PDF links when supplied. The `abstract` field contains a search snippet, identified by `abstract_source: snippet` in `extra` (serialized as Python's dictionary string representation). It is not a full paper abstract.
+
+Scholar provides search only: there are no Scholar MCP read/download tools, and the CLI connector retains its unsupported read/download behavior. Follow the returned `pdf_url` or publisher link to obtain full text. Search never downloads linked PDFs. The former Scholar proxy setting, local HTML scraping, CAPTCHA handling, and scraping fallback have been removed. No citation, author, or versions tools are added.
+
+Provider failures appear under `errors.scopus` or `errors.google_scholar` in aggregate search results, while successful sources still contribute papers. A failure on a later page fails that provider's entire search rather than returning partial results as complete. Genuine empty results return an empty list without a provider error. See [Validation](#validation) for mocked checks and credential-gated live scripts.
+
+The Scopus integration is adapted from [mildwall's PR #89](https://github.com/openags/paper-search-mcp/pull/89), reviewed at commit `81e46d7e45c0abaa4a40f515c581baf66ceaac24` (MIT), with direct [Elsevier Article Retrieval](https://dev.elsevier.com/documentation/ArticleRetrievalAPI.wadl) for text and PDFs.
+
+## Additional Repository and Discovery Sources
+
+Four additional repository and discovery connectors are integrated into the MCP server and CLI:
 
 - `zenodo`: Official Zenodo REST API connector (search + record-dependent PDF/read support).
 - `hal`: HAL public API connector (search + record-dependent PDF/read support).
@@ -180,18 +227,20 @@ SSRN integration remains compliance-first: it only attempts direct public PDF li
 
 ## Sci-Hub Notice
 
-Sci-Hub support can remain available as an optional connector for users who explicitly choose to enable it, but it should not be treated as the default or recommended full-text path.
+Sci-Hub is a final fallback in the MCP `download_with_fallback` tool after source-native and open-access attempts. Its current parameter default is `use_scihub=True`; pass `use_scihub=False` to disable that fallback. Sci-Hub is not included in `sources="all"` searches.
 
 - Availability is unstable and mirrors change frequently.
 - Legal and policy risks vary by jurisdiction.
-- README and tool descriptions should clearly state that users are responsible for enabling and using it.
+- Users are responsible for their use of this fallback.
 - Open-access and publisher-permitted sources should be tried first whenever possible.
 
 ---
 
 ## Installation
 
-Choose the method that best fits your workflow. All methods support the same [optional API keys](#credential--api-key-requirements).
+This README describes the current source tree. To use the Scopus and SerpAPI changes from this checkout, [run from source](#method-7--clone--run-from-source-development--recommended-for-macos-local) or [build Docker locally](#method-6--docker). Package and hosted installs use the version published to their respective registries.
+
+For local installations, configure [credentials in the user `.env` file](#environment-variables-env-file). The local MCP examples below use that file. If you instead add an `env` block to your MCP client configuration, include only the values you want to override: even an empty environment value takes precedence over the file.
 
 ---
 
@@ -246,7 +295,7 @@ Smithery automatically writes the correct config block for you. No manual JSON e
 
 ---
 
-### Method 2 — `uvx` (no install, always latest)
+### Method 2 — `uvx` (no install)
 
 `uvx` runs the package directly from PyPI without a permanent install. Requires [uv](https://docs.astral.sh/uv/getting-started/installation/).
 
@@ -264,16 +313,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
   "mcpServers": {
     "paper-search-mcp": {
       "command": "uvx",
-      "args": ["paper-search-mcp"],
-      "env": {
-        "PAPER_SEARCH_MCP_UNPAYWALL_EMAIL": "your@email.com",
-        "PAPER_SEARCH_MCP_CORE_API_KEY": "",
-        "PAPER_SEARCH_MCP_SEMANTIC_SCHOLAR_API_KEY": "",
-        "PAPER_SEARCH_MCP_ZENODO_ACCESS_TOKEN": "",
-        "PAPER_SEARCH_MCP_GOOGLE_SCHOLAR_PROXY_URL": "",
-        "PAPER_SEARCH_MCP_IEEE_API_KEY": "",
-        "PAPER_SEARCH_MCP_ACM_API_KEY": ""
-      }
+      "args": ["paper-search-mcp"]
     }
   }
 }
@@ -294,16 +334,7 @@ uv tool install paper-search-mcp
   "mcpServers": {
     "paper-search-mcp": {
       "command": "uv",
-      "args": ["tool", "run", "paper-search-mcp"],
-      "env": {
-        "PAPER_SEARCH_MCP_UNPAYWALL_EMAIL": "your@email.com",
-        "PAPER_SEARCH_MCP_CORE_API_KEY": "",
-        "PAPER_SEARCH_MCP_SEMANTIC_SCHOLAR_API_KEY": "",
-        "PAPER_SEARCH_MCP_ZENODO_ACCESS_TOKEN": "",
-        "PAPER_SEARCH_MCP_GOOGLE_SCHOLAR_PROXY_URL": "",
-        "PAPER_SEARCH_MCP_IEEE_API_KEY": "",
-        "PAPER_SEARCH_MCP_ACM_API_KEY": ""
-      }
+      "args": ["tool", "run", "paper-search-mcp"]
     }
   }
 }
@@ -324,16 +355,7 @@ pip install paper-search-mcp
   "mcpServers": {
     "paper-search-mcp": {
       "command": "python",
-      "args": ["-m", "paper_search_mcp.server"],
-      "env": {
-        "PAPER_SEARCH_MCP_UNPAYWALL_EMAIL": "your@email.com",
-        "PAPER_SEARCH_MCP_CORE_API_KEY": "",
-        "PAPER_SEARCH_MCP_SEMANTIC_SCHOLAR_API_KEY": "",
-        "PAPER_SEARCH_MCP_ZENODO_ACCESS_TOKEN": "",
-        "PAPER_SEARCH_MCP_GOOGLE_SCHOLAR_PROXY_URL": "",
-        "PAPER_SEARCH_MCP_IEEE_API_KEY": "",
-        "PAPER_SEARCH_MCP_ACM_API_KEY": ""
-      }
+      "args": ["-m", "paper_search_mcp.server"]
     }
   }
 }
@@ -371,35 +393,33 @@ npx -y @smithery/cli run @openags/paper-search-mcp
 
 ### Method 6 — Docker
 
+Create the [user `.env` file](#environment-variables-env-file) first, then pass it into the container:
+
 ```bash
 docker build -t paper-search-mcp .
 docker run --rm -i \
-  -e PAPER_SEARCH_MCP_UNPAYWALL_EMAIL=your@email.com \
-  -e PAPER_SEARCH_MCP_CORE_API_KEY=your_core_key \
+  --env-file "$HOME/.config/paper-search-mcp/.env" \
   paper-search-mcp
 ```
 
-**Claude Desktop config:**
+**Claude Desktop config** (replace the file path with your absolute host path):
 
 ```json
 {
   "mcpServers": {
     "paper-search-mcp": {
       "command": "docker",
-      "args": ["run", "--rm", "-i", "paper-search-mcp"],
-      "env": {
-        "PAPER_SEARCH_MCP_UNPAYWALL_EMAIL": "your@email.com",
-        "PAPER_SEARCH_MCP_CORE_API_KEY": "",
-        "PAPER_SEARCH_MCP_SEMANTIC_SCHOLAR_API_KEY": "",
-        "PAPER_SEARCH_MCP_ZENODO_ACCESS_TOKEN": "",
-        "PAPER_SEARCH_MCP_GOOGLE_SCHOLAR_PROXY_URL": "",
-        "PAPER_SEARCH_MCP_IEEE_API_KEY": "",
-        "PAPER_SEARCH_MCP_ACM_API_KEY": ""
-      }
+      "args": [
+        "run", "--rm", "-i",
+        "--env-file", "/absolute/path/to/.config/paper-search-mcp/.env",
+        "paper-search-mcp"
+      ]
     }
   }
 }
 ```
+
+Docker does not automatically forward the host's environment or load the host's user config file. Use `--env-file` as above, or explicit `-e` arguments. The image includes both `paper-search-mcp` and `paper-search`; append `paper-search sources` to the `docker run` command to list configured CLI sources.
 
 ---
 
@@ -430,26 +450,13 @@ uv run -m paper_search_mcp.server
         "run",
         "--directory", "/path/to/paper-search-mcp",
         "-m", "paper_search_mcp.server"
-      ],
-      "env": {
-        "PAPER_SEARCH_MCP_UNPAYWALL_EMAIL": "your@email.com",
-        "PAPER_SEARCH_MCP_CORE_API_KEY": "",
-        "PAPER_SEARCH_MCP_SEMANTIC_SCHOLAR_API_KEY": "",
-        "PAPER_SEARCH_MCP_ZENODO_ACCESS_TOKEN": "",
-        "PAPER_SEARCH_MCP_GOOGLE_SCHOLAR_PROXY_URL": "",
-        "PAPER_SEARCH_MCP_IEEE_API_KEY": "",
-        "PAPER_SEARCH_MCP_ACM_API_KEY": ""
-      }
+      ]
     }
   }
 }
 ```
 
-For example, if you cloned to `/Users/mac/Pengsong/paper-search-mcp`:
-
-```json
-"args": ["run", "--directory", "/Users/mac/Pengsong/paper-search-mcp", "-m", "paper_search_mcp.server"]
-```
+In an existing checkout, skip cloning and use its directory. To run the CLI against that checkout, prefix the earlier CLI examples with `uv run`, for example `uv run paper-search sources`.
 
 > `uv run` automatically installs dependencies into an isolated environment on first run — no `pip install` or `venv` needed.
 
@@ -464,12 +471,10 @@ uv pip install -e ".[dev]"
 
 ### Environment Variables (`.env` file)
 
-Instead of putting keys directly in the JSON config you can store them in the user config file (auto-loaded on startup):
+The server and CLI load `~/.config/paper-search-mcp/.env` on startup. Create or edit that file with the settings below, or use this checkout's [.env.example](.env.example) as a template:
 
 ```bash
 mkdir -p ~/.config/paper-search-mcp
-curl -fsSL https://raw.githubusercontent.com/openags/paper-search-mcp/main/.env.example \
-  -o ~/.config/paper-search-mcp/.env
 $EDITOR ~/.config/paper-search-mcp/.env
 ```
 
@@ -477,15 +482,20 @@ $EDITOR ~/.config/paper-search-mcp/.env
 PAPER_SEARCH_MCP_UNPAYWALL_EMAIL=your@email.com
 PAPER_SEARCH_MCP_CORE_API_KEY=
 PAPER_SEARCH_MCP_SEMANTIC_SCHOLAR_API_KEY=
+PAPER_SEARCH_MCP_DOAJ_API_KEY=
 PAPER_SEARCH_MCP_ZENODO_ACCESS_TOKEN=
-PAPER_SEARCH_MCP_GOOGLE_SCHOLAR_PROXY_URL=
+PAPER_SEARCH_MCP_SERPAPI_API_KEY=
+PAPER_SEARCH_MCP_SCOPUS_API_KEY=
+PAPER_SEARCH_MCP_SCOPUS_INST_TOKEN=
 PAPER_SEARCH_MCP_IEEE_API_KEY=
 PAPER_SEARCH_MCP_ACM_API_KEY=
 ```
 
-To use a custom path: `export PAPER_SEARCH_MCP_ENV_FILE=/absolute/path/to/.env`
+Fill only the values you need. Leave the SerpAPI or Scopus key empty to disable that connector. Restart the MCP server after changing credentials; the next CLI invocation picks up the changes.
 
-> Legacy variable names without the `PAPER_SEARCH_MCP_` prefix (e.g. `CORE_API_KEY`, `UNPAYWALL_EMAIL`) are still supported for backward compatibility.
+To use a custom file: `export PAPER_SEARCH_MCP_ENV_FILE=/absolute/path/to/.env`. A project-local `.env` is not loaded automatically.
+
+Existing process environment values take precedence over the file, including empty values. Remove empty keys from your MCP client's `env` block if you want the file to supply them. Legacy names without the `PAPER_SEARCH_MCP_` prefix (including `SERPAPI_API_KEY`, `SCOPUS_API_KEY`, and `SCOPUS_INST_TOKEN`) are supported, but a present prefixed value takes precedence, even if empty; remove it to use the alias.
 
 ---
 
@@ -513,6 +523,23 @@ We welcome contributions! Here's how to get started:
 4. **Submit a Pull Request**:
    Push changes and create a PR on GitHub.
 
+### Validation
+
+Run the deterministic release checks with the development dependencies installed:
+
+```bash
+python -m pytest \
+  tests/test_package_entrypoints.py tests/test_config_env.py \
+  tests/test_unpaywall.py tests/test_unpaywall_source.py tests/test_fallback.py \
+  tests/test_google_scholar.py tests/test_scopus.py tests/test_source_registration.py \
+  -q --tb=short
+uv build
+```
+
+The connector tests use mocked HTTP responses and require no credentials. They cover metadata mapping, pagination, empty results, provider errors, credential redaction, Scopus XML/PDF handling, redirects, and source/tool registration with neither key, either key, or both keys. Scholar tests reject requests to the direct Google Scholar endpoint. These checks also run in the release workflow.
+
+`tests/functional_test.py` and `tests/e2e_test.py` make live provider requests; their Scholar and Scopus sections skip when the corresponding keys are absent. When enabled, they can consume API quota, and Scopus read/download checks depend on institutional access and article availability. Mocked tests do not verify live provider access or Elsevier entitlements.
+
 ---
 
 ## Demo
@@ -527,7 +554,7 @@ We welcome contributions! Here's how to get started:
 - [√] PubMed
 - [√] bioRxiv
 - [√] medRxiv
-- [√] Google Scholar
+- [x] Google Scholar via SerpAPI (search only; API key required)
 - [√] IACR ePrint Archive
 - [√] Semantic Scholar
 - [√] Crossref
@@ -564,12 +591,12 @@ We welcome contributions! Here's how to get started:
 
 - [ ] ResearchGate
 - [ ] JSTOR
-- [ ] ScienceDirect
+- [x] ScienceDirect full text / PDFs via Scopus (entitlement-dependent)
 - [ ] Springer Link
 - [√] IEEE Xplore (optional skeleton — activate with `IEEE_API_KEY`)
 - [√] ACM Digital Library (optional skeleton — activate with `ACM_API_KEY`)
 - [ ] Web of Science
-- [ ] Scopus
+- [x] Scopus search, abstract retrieval, and ScienceDirect full text / PDFs
 
 ---
 

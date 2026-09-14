@@ -17,15 +17,21 @@ startCommand:
       PAPER_SEARCH_MCP_ZENODO_ACCESS_TOKEN:
         type: string
         description: "Access token for Zenodo (optional)"
-      PAPER_SEARCH_MCP_GOOGLE_SCHOLAR_PROXY_URL:
+      PAPER_SEARCH_MCP_SERPAPI_API_KEY:
         type: string
-        description: "HTTP/HTTPS proxy URL for Google Scholar (optional)"
+        description: "SerpAPI key to enable Google Scholar"
       PAPER_SEARCH_MCP_IEEE_API_KEY:
         type: string
         description: "API key to enable IEEE Xplore (optional)"
       PAPER_SEARCH_MCP_ACM_API_KEY:
         type: string
         description: "API key to enable ACM Digital Library (optional)"
+      PAPER_SEARCH_MCP_SCOPUS_API_KEY:
+        type: string
+        description: "Elsevier API key to enable Scopus and ScienceDirect retrieval"
+      PAPER_SEARCH_MCP_SCOPUS_INST_TOKEN:
+        type: string
+        description: "Elsevier institutional token (optional alternative to network/IP entitlement)"
   commandFunction:
     |-
     (config) => {
@@ -34,9 +40,11 @@ startCommand:
       if (config.PAPER_SEARCH_MCP_CORE_API_KEY) env.PAPER_SEARCH_MCP_CORE_API_KEY = config.PAPER_SEARCH_MCP_CORE_API_KEY;
       if (config.PAPER_SEARCH_MCP_SEMANTIC_SCHOLAR_API_KEY) env.PAPER_SEARCH_MCP_SEMANTIC_SCHOLAR_API_KEY = config.PAPER_SEARCH_MCP_SEMANTIC_SCHOLAR_API_KEY;
       if (config.PAPER_SEARCH_MCP_ZENODO_ACCESS_TOKEN) env.PAPER_SEARCH_MCP_ZENODO_ACCESS_TOKEN = config.PAPER_SEARCH_MCP_ZENODO_ACCESS_TOKEN;
-      if (config.PAPER_SEARCH_MCP_GOOGLE_SCHOLAR_PROXY_URL) env.PAPER_SEARCH_MCP_GOOGLE_SCHOLAR_PROXY_URL = config.PAPER_SEARCH_MCP_GOOGLE_SCHOLAR_PROXY_URL;
+      if (config.PAPER_SEARCH_MCP_SERPAPI_API_KEY) env.PAPER_SEARCH_MCP_SERPAPI_API_KEY = config.PAPER_SEARCH_MCP_SERPAPI_API_KEY;
       if (config.PAPER_SEARCH_MCP_IEEE_API_KEY) env.PAPER_SEARCH_MCP_IEEE_API_KEY = config.PAPER_SEARCH_MCP_IEEE_API_KEY;
       if (config.PAPER_SEARCH_MCP_ACM_API_KEY) env.PAPER_SEARCH_MCP_ACM_API_KEY = config.PAPER_SEARCH_MCP_ACM_API_KEY;
+      if (config.PAPER_SEARCH_MCP_SCOPUS_API_KEY) env.PAPER_SEARCH_MCP_SCOPUS_API_KEY = config.PAPER_SEARCH_MCP_SCOPUS_API_KEY;
+      if (config.PAPER_SEARCH_MCP_SCOPUS_INST_TOKEN) env.PAPER_SEARCH_MCP_SCOPUS_INST_TOKEN = config.PAPER_SEARCH_MCP_SCOPUS_INST_TOKEN;
       return { command: 'paper-search-mcp', env };
     }
   exampleConfig:

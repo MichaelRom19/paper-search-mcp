@@ -1,233 +1,146 @@
-from typing import List, Optional
+"""Google Scholar discovery through SerpAPI; no direct Scholar requests."""
+
 from datetime import datetime
-import requests
-from bs4 import BeautifulSoup
-import time
-import random
+from hashlib import sha256
+import logging
 import re
+from urllib.parse import parse_qs, quote, quote_plus, urlsplit
+
+import httpx
+
+from ..config import get_env
 from ..paper import Paper
 from ..utils import extract_doi
-from ..config import get_env
 from .base import PaperSource
-import logging
 
-logger = logging.getLogger(__name__)
+
+def _redact_request_log(record: logging.LogRecord) -> bool:
+    # HTTPX logs query strings at INFO, including SerpAPI's required api_key.
+    record.msg = re.sub(r"([?&]api_key=)[^&\s]+", r"\1[REDACTED]", record.getMessage())
+    record.args = ()
+    return True
+
+
+logging.getLogger("httpx").addFilter(_redact_request_log)
+
 
 class GoogleScholarSearcher(PaperSource):
-    """Custom implementation of Google Scholar paper search"""
-    
-    SCHOLAR_URL = "https://scholar.google.com/scholar"
-    BROWSERS = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
-    ]
+    """Search SerpAPI and return the project's standard paper metadata."""
 
-    def __init__(self, max_retries: int = 3, retry_delay: float = 2.0, proxy_url: Optional[str] = None):
-        self.max_retries = max(1, max_retries)
-        self.retry_delay = max(0.5, retry_delay)
-        self.proxy_url = (proxy_url or get_env("GOOGLE_SCHOLAR_PROXY_URL", "")).strip()
-        self._setup_session()
+    SEARCH_URL = "https://serpapi.com/search.json"
 
-    def _setup_session(self):
-        """Initialize session with random user agent"""
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': random.choice(self.BROWSERS),
-            'Accept': 'text/html,application/xhtml+xml',
-            'Accept-Language': 'en-US,en;q=0.9'
-        })
+    def __init__(self, api_key: str | None = None):
+        self.api_key = (get_env("SERPAPI_API_KEY") if api_key is None else api_key).strip()
+        if not self.api_key:
+            raise ValueError("Set PAPER_SEARCH_MCP_SERPAPI_API_KEY (or SERPAPI_API_KEY) to enable Google Scholar.")
 
-        if self.proxy_url:
-            self.session.proxies.update({
-                'http': self.proxy_url,
-                'https': self.proxy_url
+    def _page(self, client: httpx.Client, query: str, start: int, count: int) -> dict:
+        try:
+            response = client.get(self.SEARCH_URL, params={
+                "engine": "google_scholar", "api_key": self.api_key,
+                "q": query, "hl": "en", "start": start, "num": count,
             })
+        except httpx.RequestError as exc:
+            raise RuntimeError(f"SerpAPI request failed ({type(exc).__name__}).") from None
+        try:
+            data = response.json()
+        except ValueError:
+            raise RuntimeError(f"SerpAPI returned invalid JSON (HTTP {response.status_code}).") from None
+        if not isinstance(data, dict):
+            raise RuntimeError("SerpAPI returned an invalid response object.")
 
-    def _rotate_user_agent(self):
-        self.session.headers.update({'User-Agent': random.choice(self.BROWSERS)})
+        metadata = data.get("search_metadata")
+        status = metadata.get("status") if isinstance(metadata, dict) else None
+        info = data.get("search_information") or {}
+        empty = isinstance(info, dict) and (
+            str(info.get("organic_results_state", "")).lower() == "fully empty"
+            or str(info.get("total_results")) == "0"
+        )
+        entries = data.get("organic_results")
+        if response.status_code == 200 and status == "Success":
+            if empty and not entries:
+                return {"organic_results": []}
+            if not data.get("error") and isinstance(entries, list):
+                return data
+
+        message = str(data.get("error") or f"Unexpected response (HTTP {response.status_code}, status {status!r}).")
+        for secret in (self.api_key, quote(self.api_key, safe=""), quote_plus(self.api_key)):
+            message = message.replace(secret, "[REDACTED]")
+        raise RuntimeError(f"SerpAPI: {message}")
 
     @staticmethod
-    def _is_captcha_page(soup: BeautifulSoup) -> bool:
-        return bool(
-            soup.find('form', {'id': 'gs_captcha_f'})
-            or soup.find('input', {'name': 'captcha'})
-            or 'please show you\'re not a robot' in soup.get_text(' ', strip=True).lower()
+    def _parse_paper(item: dict) -> Paper:
+        if not isinstance(item, dict) or not isinstance(item.get("title"), str) or not item["title"].strip():
+            raise RuntimeError("SerpAPI returned a result without a title.")
+        title = item["title"].strip()
+        url = item.get("link") or ""
+        info = item.get("publication_info") or {}
+        summary = info.get("summary") or ""
+        authors = [author["name"] for author in info.get("authors", []) or []
+                   if isinstance(author, dict) and author.get("name")]
+        if not authors and " - " in summary:
+            authors = [name.strip() for name in summary.split(" - ", 1)[0].split(",") if name.strip()]
+        year = re.search(r"\b(?:18|19|20)\d{2}\b", summary)
+        resources = item.get("resources") or []
+        pdf_url = next((resource.get("link", "") for resource in resources
+                        if isinstance(resource, dict) and resource.get("file_format", "").upper() == "PDF"), "")
+        if not pdf_url and urlsplit(url).path.lower().endswith(".pdf"):
+            pdf_url = url
+        cited_by = (item.get("inline_links") or {}).get("cited_by") or {}
+        try:
+            citations = max(0, int(cited_by.get("total", 0)))
+        except (TypeError, ValueError):
+            citations = 0
+        snippet = item.get("snippet") or ""
+        identifier = item.get("result_id") or sha256(f"{url}\n{title}\n{summary}".encode()).hexdigest()[:24]
+        return Paper(
+            paper_id=f"gs_{identifier}", title=title, authors=authors, abstract=snippet,
+            doi=next((doi for text in (url, pdf_url, title, summary, snippet) if (doi := extract_doi(text))), ""),
+            published_date=datetime(int(year[0]), 1, 1) if year else None,
+            url=url, pdf_url=pdf_url, source="google_scholar", citations=citations,
+            extra={"abstract_source": "snippet", "publication_info": summary},
         )
 
-    def _extract_year(self, text: str) -> Optional[int]:
-        """Extract year from publication info"""
-        for word in text.split():
-            if word.isdigit() and 1900 <= int(word) <= datetime.now().year:
-                return int(word)
-        return None
-
-    def _parse_paper(self, item) -> Optional[Paper]:
-        """Parse single paper entry from HTML"""
-        try:
-            # Extract main paper elements
-            title_elem = item.find('h3', class_='gs_rt')
-            info_elem = item.find('div', class_='gs_a')
-            abstract_elem = item.find('div', class_='gs_rs')
-
-            if not title_elem or not info_elem:
-                return None
-
-            # Process title and URL
-            title = title_elem.get_text(strip=True).replace('[PDF]', '').replace('[HTML]', '')
-            link = title_elem.find('a', href=True)
-            url = link['href'] if link else ''
-
-            # Process author info
-            info_text = info_elem.get_text()
-            authors = [a.strip() for a in info_text.split('-')[0].split(',')]
-            year = self._extract_year(info_text)
-            doi = (
-                extract_doi(url)
-                or extract_doi(title)
-                or extract_doi(info_text)
-                or extract_doi(abstract_elem.get_text() if abstract_elem else "")
-            )
-
-            # Create paper object
-            return Paper(
-                paper_id=f"gs_{hash(url)}",
-                title=title,
-                authors=authors,
-                abstract=abstract_elem.get_text() if abstract_elem else "",
-                url=url,
-                pdf_url="",
-                published_date=datetime(year, 1, 1) if year else None,
-                updated_date=None,
-                source="google_scholar",
-                categories=[],
-                keywords=[],
-                doi=doi,
-                citations=0
-            )
-        except Exception as e:
-            logger.warning(f"Failed to parse paper: {e}")
-            return None
-
-    def search(self, query: str, max_results: int = 10) -> List[Paper]:
-        """
-        Search Google Scholar with custom parameters
-        """
-        papers = []
+    def search(self, query: str, max_results: int = 10) -> list[Paper]:
+        if max_results <= 0:
+            return []
+        if not query.strip():
+            raise ValueError("Google Scholar query must not be empty.")
+        papers: dict[str, Paper] = {}
         start = 0
-        results_per_page = min(10, max_results)
-
-        while len(papers) < max_results:
-            try:
-                # Construct search parameters
-                params = {
-                    'q': query,
-                    'start': start,
-                    'hl': 'en',
-                    'as_sdt': '0,5'  # Include articles and citations
-                }
-
-                response = None
-                for attempt in range(self.max_retries):
-                    self._rotate_user_agent()
-                    time.sleep(random.uniform(1.0, 2.5))
-
-                    response = self.session.get(self.SCHOLAR_URL, params=params, timeout=30)
-                    if response.status_code == 200:
-                        break
-
-                    if response.status_code in (403, 429, 503):
-                        wait_time = self.retry_delay * (2 ** attempt)
-                        wait_time += random.uniform(0, 0.5)
-                        logger.warning(
-                            "Google Scholar returned %s (attempt %s/%s). Backing off %.1fs",
-                            response.status_code,
-                            attempt + 1,
-                            self.max_retries,
-                            wait_time,
-                        )
-                        time.sleep(wait_time)
-                        continue
-
-                    logger.error("Search failed with non-retryable status %s", response.status_code)
-                    break
-
-                if response is None or response.status_code != 200:
-                    logger.error("Google Scholar search aborted after retries")
-                    break
-
-                # Parse results
-                soup = BeautifulSoup(response.text, 'html.parser')
-
-                if self._is_captcha_page(soup):
-                    logger.warning(
-                        "Google Scholar returned a bot-detection/captcha page. "
-                        "Set PAPER_SEARCH_MCP_GOOGLE_SCHOLAR_PROXY_URL/GOOGLE_SCHOLAR_PROXY_URL "
-                        "or reduce request frequency."
-                    )
-                    break
-
-                results = soup.find_all('div', class_='gs_ri')
-
-                if not results:
-                    break
-
-                # Process each result
-                for item in results:
-                    if len(papers) >= max_results:
-                        break
-                        
+        with httpx.Client(timeout=httpx.Timeout(60, connect=10)) as client:
+            while len(papers) < max_results:
+                data = self._page(client, query, start, min(20, max_results - len(papers)))
+                previous_count = len(papers)
+                for item in data["organic_results"]:
                     paper = self._parse_paper(item)
-                    if paper:
-                        papers.append(paper)
-
-                start += results_per_page
-
-            except Exception as e:
-                logger.error(f"Search error: {e}")
-                break
-
-        return papers[:max_results]
+                    papers.setdefault(paper.paper_id, paper)
+                    if len(papers) == max_results:
+                        break
+                if len(papers) == max_results:
+                    break
+                pagination = data.get("serpapi_pagination") or {}
+                next_url = pagination.get("next") or pagination.get("next_link")
+                if len(papers) == previous_count or not next_url:
+                    break
+                try:
+                    next_start = int(parse_qs(urlsplit(next_url).query)["start"][0])
+                except (KeyError, ValueError, TypeError):
+                    raise RuntimeError("SerpAPI returned invalid pagination.") from None
+                if next_start <= start:
+                    break
+                # Only consume the offset; never follow an API-supplied URL with our key.
+                start = next_start
+        return list(papers.values())
 
     def download_pdf(self, paper_id: str, save_path: str) -> str:
-        """
-        Google Scholar doesn't support direct PDF downloads
-        
-        Raises:
-            NotImplementedError: Always raises this error
-        """
         raise NotImplementedError(
             "Google Scholar doesn't provide direct PDF downloads. "
-            "Please use the paper URL to access the publisher's website."
+            "Please use the paper's PDF URL or publisher's website."
         )
 
     def read_paper(self, paper_id: str, save_path: str = "./downloads") -> str:
-        """
-        Google Scholar doesn't support direct paper reading
-        
-        Returns:
-            str: Message indicating the feature is not supported
-        """
         return (
             "Google Scholar doesn't support direct paper reading. "
             "Please use the paper URL to access the full text on the publisher's website."
         )
-
-if __name__ == "__main__":
-    # Test Google Scholar searcher
-    searcher = GoogleScholarSearcher()
-    
-    print("Testing search functionality...")
-    query = "machine learning"
-    max_results = 5
-    
-    try:
-        papers = searcher.search(query, max_results=max_results)
-        print(f"\nFound {len(papers)} papers for query '{query}':")
-        for i, paper in enumerate(papers, 1):
-            print(f"\n{i}. {paper.title}")
-            print(f"   Authors: {', '.join(paper.authors)}")
-            print(f"   Citations: {paper.citations}")
-            print(f"   URL: {paper.url}")
-    except Exception as e:
-        print(f"Error during search: {e}")

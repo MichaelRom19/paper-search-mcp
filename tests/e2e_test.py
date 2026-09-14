@@ -124,21 +124,50 @@ if ok_s:
 results["medrxiv"] = (ok_s, ok_d, ok_r)
 
 # ── 5. Google Scholar ─────────────────────────────────────────────────────────
-print("\n[5] Google Scholar  (download not supported)")
+print("\n[5] Google Scholar via SerpAPI (search only)")
 from paper_search_mcp.academic_platforms.google_scholar import GoogleScholarSearcher
-s = GoogleScholarSearcher()
-ok_s, paper = check_search("google_scholar", s.search("deep learning survey", max_results=2), optional=True)
-ok_d = None if ok_s is None else False
-ok_r = None
-if ok_s:
+ok_s = ok_d = ok_r = None
+if get_env("SERPAPI_API_KEY").strip():
+    s = GoogleScholarSearcher()
     try:
-        s.download_pdf(paper.paper_id, SAVE_PATH)
-        err("download should have raised NotImplementedError")
-    except NotImplementedError:
-        ok("download correctly raises NotImplementedError")
-        ok_d = True
-        ok("read is not supported for Google Scholar results")
+        ok_s, paper = check_search("google_scholar", s.search("deep learning survey", max_results=2))
+        try:
+            s.download_pdf("unsupported", SAVE_PATH)
+            ok_d = False
+        except NotImplementedError:
+            ok_d = True
+    except Exception as exc:
+        err(f"Google Scholar search failed: {exc}")
+        ok_s = False
+else:
+    warn("Set PAPER_SEARCH_MCP_SERPAPI_API_KEY to test Google Scholar")
 results["google_scholar"] = (ok_s, ok_d, ok_r)
+
+# ── Scopus / ScienceDirect ────────────────────────────────────────────────────
+print("\n[Scopus] Elsevier search, full text, and PDF retrieval")
+from paper_search_mcp.academic_platforms.scopus import ScopusSearcher
+ok_s = ok_d = ok_r = None
+if get_env("SCOPUS_API_KEY").strip():
+    s = ScopusSearcher()
+    try:
+        ok_s, paper = check_search("scopus", s.search("deep learning survey", max_results=2))
+        if ok_s:
+            content = s.read_paper(paper.paper_id)
+            if "ABSTRACT ONLY" in content:
+                warn("Full text unavailable; returned a labeled abstract-only result")
+            else:
+                ok_r = "FULL TEXT\n" in content
+                ok(f"read: {len(content)} characters")
+            ok_d, _ = check_download("scopus", s.download_pdf, paper.paper_id)
+    except Exception as exc:
+        err(f"Scopus/ScienceDirect operation failed: {exc}")
+        if ok_s is None:
+            ok_s = False
+        else:
+            ok_r = False
+else:
+    warn("Set PAPER_SEARCH_MCP_SCOPUS_API_KEY to test Scopus/ScienceDirect")
+results["scopus"] = (ok_s, ok_d, ok_r)
 
 # ── 6. IACR ───────────────────────────────────────────────────────────────────
 print("\n[6] IACR  (fetch_details=False for speed; download uses paper_id)")
