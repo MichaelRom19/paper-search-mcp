@@ -3,6 +3,13 @@ import unittest
 from datetime import datetime
 from unittest.mock import patch
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def configured_email(monkeypatch):
+    monkeypatch.setenv("PAPER_SEARCH_MCP_UNPAYWALL_EMAIL", "fixture@example.test")
+
 from paper_search_mcp import server
 from paper_search_mcp.paper import Paper
 

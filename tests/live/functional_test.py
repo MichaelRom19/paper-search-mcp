@@ -1,10 +1,16 @@
 """
 Functional test script to verify all academic platform searchers work correctly.
-Run with: python tests/functional_test.py
+Run with: python tests/live/functional_test.py --live
 """
+import argparse
+
+parser = argparse.ArgumentParser(description="Live provider checks (may consume API quota)")
+parser.add_argument("--live", action="store_true", required=True, help="Allow live provider requests")
+parser.parse_args()
+
 import sys
 import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from paper_search_mcp.config import get_env
 

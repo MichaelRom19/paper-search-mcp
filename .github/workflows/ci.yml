@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: '0.11.32'
+      - name: Install locked dependencies
+        run: uv sync --locked --extra dev
+      - name: Verify runtime and offline regressions
+        run: |
+          uv run --locked python -c "import platform; assert platform.python_version() == '3.14.7'"
+          uv run --locked python -m compileall -q paper_search_mcp tests
+          uv run --locked pytest -q --tb=short
+      - name: Build distributions with locked build dependencies
+        run: uv build --no-build-isolation
+      - name: Verify installed wheel and console entry points
+        run: |
+          uv venv /tmp/paper-search-wheel
+          uv export --locked --no-dev --no-emit-project --format requirements-txt --output-file /tmp/paper-search-requirements.txt
+          uv pip install --python /tmp/paper-search-wheel/bin/python -r /tmp/paper-search-requirements.txt
+          uv pip install --python /tmp/paper-search-wheel/bin/python --no-deps dist/*.whl
+          cd /tmp
+          /tmp/paper-search-wheel/bin/paper-search --help
+          /tmp/paper-search-wheel/bin/paper-search sources
+          /tmp/paper-search-wheel/bin/python -c "from importlib.metadata import distribution; d = distribution('paper-search-mcp'); scripts = {e.name: e.load() for e in d.entry_points}; assert callable(scripts['paper-search-mcp']); assert callable(scripts['paper-search'])"
+      - name: Verify Docker runtime and CLI
+        run: |
+          docker build -t paper-search-mcp:ci .
+          docker run --rm paper-search-mcp:ci python -c "import platform; assert platform.python_version() == '3.14.7'"
+          docker run --rm paper-search-mcp:ci paper-search sources

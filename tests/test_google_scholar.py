@@ -96,14 +96,22 @@ def test_short_page_uses_provider_offset(mock_http):
 @pytest.mark.parametrize("next_start", [0, -10])
 def test_nonadvancing_offset_stops(mock_http, next_start):
     mock_http.responses.append(page([ENTRY], next_start))
-    assert len(GoogleScholarSearcher(KEY).search("query")) == 1
+    with pytest.raises(RuntimeError, match="did not advance"):
+        GoogleScholarSearcher(KEY).search("query")
     assert len(mock_http.requests) == 1
 
 
-def test_repeated_page_stops_and_deduplicates(mock_http):
-    mock_http.responses.extend([page([ENTRY], 10), page([ENTRY], 20)])
+def test_snippet_doi_is_not_publication_identity(mock_http):
+    item = {"result_id": "snippet", "title": "A replication study", "link": "https://example.test/study",
+            "snippet": "Replicates the methods from doi:10.1234/unrelated"}
+    mock_http.responses.append(page([item]))
+    assert GoogleScholarSearcher(KEY).search("query")[0].doi == ""
+
+
+def test_duplicate_only_page_does_not_imply_exhaustion(mock_http):
+    mock_http.responses.extend([page([ENTRY], 10), page([ENTRY], 20), page([])])
     assert len(GoogleScholarSearcher(KEY).search("query")) == 1
-    assert len(mock_http.requests) == 2
+    assert len(mock_http.requests) == 3
 
 
 @pytest.mark.parametrize("data", [
@@ -153,7 +161,7 @@ def test_invalid_json_and_network_failure(mock_http):
 
 def test_later_page_failure_propagates(mock_http):
     mock_http.responses.extend([page([ENTRY], 10), httpx.Response(429, json={"error": "Quota exhausted"})])
-    with pytest.raises(RuntimeError, match="Quota exhausted"):
+    with pytest.raises(RuntimeError, match="quota"):
         GoogleScholarSearcher(KEY).search("query")
 
 
@@ -213,7 +221,8 @@ def test_read_and_download_remain_unsupported(mock_http, tmp_path):
     assert not mock_http.requests
 
 
-def test_satisfied_limit_does_not_process_unused_pagination(mock_http):
+def test_malformed_pagination_is_visible_even_when_display_is_full(mock_http):
     mock_http.responses.append(page([ENTRY], "malformed"))
-    assert len(GoogleScholarSearcher(KEY).search("query", 1)) == 1
+    with pytest.raises(RuntimeError, match="pagination"):
+        GoogleScholarSearcher(KEY).search("query", 1)
     assert len(mock_http.requests) == 1

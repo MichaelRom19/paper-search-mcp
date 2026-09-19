@@ -2,7 +2,6 @@
 
 from datetime import datetime
 from hashlib import sha256
-import logging
 import re
 from urllib.parse import parse_qs, quote, quote_plus, urlsplit
 
@@ -10,18 +9,11 @@ import httpx
 
 from ..config import get_env
 from ..paper import Paper
+from ..http import ProviderHTTP, RequestAllowance, RequestFailure, sanitize
+from ..library import identifiers, validate_date
+from ..provider_models import Metadata, SavedQuery, ProviderPage, ProviderError, RejectedRecord, ReportedTotal
 from ..utils import extract_doi
 from .base import PaperSource
-
-
-def _redact_request_log(record: logging.LogRecord) -> bool:
-    # HTTPX logs query strings at INFO, including SerpAPI's required api_key.
-    record.msg = re.sub(r"([?&]api_key=)[^&\s]+", r"\1[REDACTED]", record.getMessage())
-    record.args = ()
-    return True
-
-
-logging.getLogger("httpx").addFilter(_redact_request_log)
 
 
 class GoogleScholarSearcher(PaperSource):
@@ -34,14 +26,14 @@ class GoogleScholarSearcher(PaperSource):
         if not self.api_key:
             raise ValueError("Set PAPER_SEARCH_MCP_SERPAPI_API_KEY (or SERPAPI_API_KEY) to enable Google Scholar.")
 
-    def _page(self, client: httpx.Client, query: str, start: int, count: int) -> dict:
-        try:
-            response = client.get(self.SEARCH_URL, params={
-                "engine": "google_scholar", "api_key": self.api_key,
-                "q": query, "hl": "en", "start": start, "num": count,
-            })
-        except httpx.RequestError as exc:
-            raise RuntimeError(f"SerpAPI request failed ({type(exc).__name__}).") from None
+    @property
+    def http(self):
+        return ProviderHTTP("SerpAPI", self.SEARCH_URL, params={"api_key": self.api_key})
+
+    def _page(self, client: httpx.Client, query: str, start: int, count: int, allowance: RequestAllowance) -> dict:
+        response = self.http.get(client, self.SEARCH_URL, allowance, params={
+            "engine": "google_scholar", "q": query, "hl": "en", "start": start, "num": count,
+        })
         try:
             data = response.json()
         except ValueError:
@@ -63,6 +55,10 @@ class GoogleScholarSearcher(PaperSource):
             if not data.get("error") and isinstance(entries, list):
                 return data
 
+        if data.get("error"):
+            message = str(data["error"]).lower()
+            kind = "quota" if any(word in message for word in ("run out of searches", "quota", "credits exhausted")) else "authentication" if any(word in message for word in ("invalid api key", "invalid api_key", "unauthorized")) else "service"
+            raise RequestFailure(ProviderError(kind=kind, message=f"SerpAPI: {kind} error."))
         message = str(data.get("error") or f"Unexpected response (HTTP {response.status_code}, status {status!r}).")
         for secret in (self.api_key, quote(self.api_key, safe=""), quote_plus(self.api_key)):
             message = message.replace(secret, "[REDACTED]")
@@ -95,43 +91,87 @@ class GoogleScholarSearcher(PaperSource):
         identifier = item.get("result_id") or sha256(f"{url}\n{title}\n{summary}".encode()).hexdigest()[:24]
         return Paper(
             paper_id=f"gs_{identifier}", title=title, authors=authors, abstract=snippet,
-            doi=next((doi for text in (url, pdf_url, title, summary, snippet) if (doi := extract_doi(text))), ""),
+            doi=next((doi for text in (url, pdf_url) if (doi := extract_doi(text))), ""),
             published_date=datetime(int(year[0]), 1, 1) if year else None,
             url=url, pdf_url=pdf_url, source="google_scholar", citations=citations,
             extra={"abstract_source": "snippet", "publication_info": summary},
         )
 
+    def search_page(self, query: SavedQuery, continuation=None, *, allowance=None) -> ProviderPage:
+        if query.source != "google_scholar" or query.mode not in ("native_query", "relevance") or query.filters or query.sort:
+            raise ValueError("Unsupported Scholar query options.")
+        if not query.query.strip():
+            raise ValueError("Google Scholar query must not be empty.")
+        allowance = allowance if allowance is not None else RequestAllowance()
+        before = allowance.used
+        state = continuation or {"start": 0}
+        start = state.get("start")
+        if set(state) != {"start"} or type(start) is not int or start < 0:
+            raise ValueError("Invalid Scholar continuation.")
+        page = ProviderPage(continuation=state, warnings=["Scholar retrieval ceiling is approximately 1000 results; totals are estimates."])
+        if start >= 1000:
+            page.state = "provider_cap"
+            page.error = ProviderError(kind="provider_cap", message="Scholar retrieval ceiling reached.")
+            return page
+        try:
+            with httpx.Client() as client:
+                data = self._page(client, query.query, start, min(20, query.page_size), allowance)
+            for item in data["organic_results"]:
+                clean = sanitize(item, (self.api_key,))
+                try:
+                    record = Metadata.from_paper(self._parse_paper(clean))
+                    identifiers(record)
+                    validate_date(record.published_date, record.date_precision)
+                    page.records.append(record)
+                except (ValueError, TypeError, KeyError, AttributeError, RuntimeError):
+                    page.rejected.append(RejectedRecord(raw=clean, reason="Invalid Scholar record (title or metadata)."))
+            total = (data.get("search_information") or {}).get("total_results")
+            if total is not None:
+                page.total = ReportedTotal(value=int(total), precision="estimated")
+            pagination = data.get("serpapi_pagination") or {}
+            next_url = pagination.get("next") or pagination.get("next_link")
+            if next_url:
+                try:
+                    offset = int(parse_qs(urlsplit(next_url).query)["start"][0])
+                except (KeyError, ValueError, TypeError):
+                    raise RuntimeError("SerpAPI returned invalid pagination.") from None
+                if offset <= start:
+                    page.state = "failed"
+                    page.error = ProviderError(kind="nonadvancing", message="SerpAPI pagination did not advance.")
+                else:
+                    page.continuation = {"start": offset}
+            else:
+                page.state, page.continuation = "exhausted", None
+            if start + len(data["organic_results"]) >= 1000 or page.continuation and page.continuation["start"] >= 1000:
+                page.state = "provider_cap"
+                page.error = ProviderError(kind="provider_cap", message="Scholar retrieval ceiling reached.")
+        except RequestFailure as exc:
+            page.error = exc.error
+            page.state = "budget" if exc.error.kind == "budget" else "waiting" if exc.error.retry_at else "failed"
+        except (ValueError, TypeError, AttributeError, RuntimeError) as exc:
+            page.state = "failed"
+            page.error = ProviderError(kind="malformed_response", message=sanitize(str(exc), (self.api_key,)))
+        page.requests_used = allowance.used - before
+        return page
+
     def search(self, query: str, max_results: int = 10) -> list[Paper]:
         if max_results <= 0:
             return []
-        if not query.strip():
-            raise ValueError("Google Scholar query must not be empty.")
-        papers: dict[str, Paper] = {}
-        start = 0
-        with httpx.Client(timeout=httpx.Timeout(60, connect=10)) as client:
-            while len(papers) < max_results:
-                data = self._page(client, query, start, min(20, max_results - len(papers)))
-                previous_count = len(papers)
-                for item in data["organic_results"]:
-                    paper = self._parse_paper(item)
-                    papers.setdefault(paper.paper_id, paper)
-                    if len(papers) == max_results:
-                        break
-                if len(papers) == max_results:
-                    break
-                pagination = data.get("serpapi_pagination") or {}
-                next_url = pagination.get("next") or pagination.get("next_link")
-                if len(papers) == previous_count or not next_url:
-                    break
-                try:
-                    next_start = int(parse_qs(urlsplit(next_url).query)["start"][0])
-                except (KeyError, ValueError, TypeError):
-                    raise RuntimeError("SerpAPI returned invalid pagination.") from None
-                if next_start <= start:
-                    break
-                # Only consume the offset; never follow an API-supplied URL with our key.
-                start = next_start
-        return list(papers.values())
+        papers = {}
+        continuation = None
+        while len(papers) < max_results:
+            page = self.search_page(SavedQuery(source="google_scholar", query=query,
+                page_size=min(20, max_results - len(papers))), continuation)
+            for record in page.records:
+                papers.setdefault(record.paper_id, record.to_paper())
+            if page.rejected:
+                raise RuntimeError(page.rejected[0].reason)
+            if page.error:
+                raise RequestFailure(page.error)
+            if page.state == "exhausted":
+                break
+            continuation = page.continuation
+        return list(papers.values())[:max_results]
 
     def download_pdf(self, paper_id: str, save_path: str) -> str:
         raise NotImplementedError(

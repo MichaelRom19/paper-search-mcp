@@ -1,3 +1,4 @@
+import sys
 from typing import List
 import requests
 import os
@@ -67,7 +68,7 @@ class MedRxivSearcher(PaperSource):
                                 doi=item['doi']
                             ))
                         except Exception as e:
-                            print(f"Error parsing medRxiv entry: {e}")
+                            print(f"Error parsing medRxiv entry: {e}", file=sys.stderr)
                     if len(collection) < 100:
                         break  # No more results
                     cursor += 100
@@ -75,9 +76,9 @@ class MedRxivSearcher(PaperSource):
                 except requests.exceptions.RequestException as e:
                     tries += 1
                     if tries == self.max_retries:
-                        print(f"Failed to connect to medRxiv API after {self.max_retries} attempts: {e}")
+                        print(f"Failed to connect to medRxiv API after {self.max_retries} attempts: {e}", file=sys.stderr)
                         break
-                    print(f"Attempt {tries} failed, retrying...")
+                    print(f"Attempt {tries} failed, retrying...", file=sys.stderr)
             else:
                 continue
             break
@@ -117,7 +118,7 @@ class MedRxivSearcher(PaperSource):
                 tries += 1
                 if tries == self.max_retries:
                     raise Exception(f"Failed to download PDF after {self.max_retries} attempts: {e}")
-                print(f"Attempt {tries} failed, retrying...")
+                print(f"Attempt {tries} failed, retrying...", file=sys.stderr)
     
     def read_paper(self, paper_id: str, save_path: str = "./downloads") -> str:
         """
@@ -141,5 +142,5 @@ class MedRxivSearcher(PaperSource):
                 text += page.extract_text() + "\n"
             return text.strip()
         except Exception as e:
-            print(f"Error reading PDF for paper {paper_id}: {e}")
+            print(f"Error reading PDF for paper {paper_id}: {e}", file=sys.stderr)
             return ""

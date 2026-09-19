@@ -51,7 +51,7 @@ class SciHubFetcher:
                 return None
 
             # Download the PDF
-            response = self.session.get(pdf_url, verify=False, timeout=30)
+            response = self.session.get(pdf_url, timeout=30)
             
             if response.status_code != 200:
                 logging.error(f"Failed to download PDF, status {response.status_code}")
@@ -83,7 +83,7 @@ class SciHubFetcher:
 
             # Search on Sci-Hub
             search_url = f"{self.base_url}/{identifier}"
-            response = self.session.get(search_url, verify=False, timeout=20)
+            response = self.session.get(search_url, timeout=20)
             
             if response.status_code != 200:
                 return None

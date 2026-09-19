@@ -4,8 +4,7 @@ Adapted from mildwall's openags/paper-search-mcp PR #89, commit
 81e46d7e45c0abaa4a40f515c581baf66ceaac24 (MIT).
 """
 
-from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
+from datetime import datetime
 from pathlib import Path
 import re
 import time
@@ -16,6 +15,9 @@ import httpx
 
 from ..config import get_env
 from ..paper import Paper
+from ..http import ProviderHTTP, RequestAllowance, RequestFailure, sanitize, retry_delay
+from ..library import identifiers, validate_date
+from ..provider_models import Metadata, SavedQuery, ProviderPage, ProviderError, RejectedRecord, ReportedTotal
 from .base import PaperSource
 
 
@@ -44,66 +46,25 @@ class ScopusSearcher(PaperSource):
             headers["X-ELS-Insttoken"] = self.inst_token
         return httpx.Client(headers=headers, timeout=httpx.Timeout(30, connect=10))
 
-    def _error(self, response: httpx.Response) -> ScopusAPIError:
-        message = response.reason_phrase
-        try:
-            data = response.json()
-            message = (data.get("service-error", {}).get("status", {}).get("statusText")
-                       or data.get("error-response", {}).get("error-message") or message)
-        except (ValueError, AttributeError):
-            try:
-                message = ET.fromstring(response.content).findtext(".//{*}statusText") or message
-            except ET.ParseError:
-                pass
-        message = str(message)
-        if response.status_code == 401:
-            message += ". Check your Scopus API key."
-        elif response.status_code == 403:
-            message += ". Check institutional network/VPN or SCOPUS_INST_TOKEN entitlement."
-        elif response.status_code == 429:
-            message += ". Rate limit or quota exceeded."
-            if reset := response.headers.get("X-RateLimit-Reset"):
-                message += f" Quota reset: {reset}."
-        if retry_after := response.headers.get("Retry-After"):
-            message += f" Retry-After: {retry_after}."
-        for secret in (self.api_key, self.inst_token):
-            if secret:
-                message = message.replace(secret, "[REDACTED]")
-        return ScopusAPIError(response.status_code, message)
-
-    @staticmethod
-    def _retry_delay(value: str, default: float) -> float:
-        try:
-            return max(0, float(value))
-        except ValueError:
-            try:
-                date = parsedate_to_datetime(value)
-                return max(0, (date - datetime.now(timezone.utc)).total_seconds())
-            except (TypeError, ValueError, OverflowError):
-                return default
+    _retry_delay = staticmethod(retry_delay)
 
     def _request(self, client: httpx.Client, url: str, *, params: dict | None = None,
                  accept: str = "application/json") -> httpx.Response:
-        for attempt in range(3):
-            delay = 2 ** (attempt + 1)
-            try:
-                response = client.get(url, params=params, headers={"Accept": accept})
-            except httpx.RequestError as exc:
-                if attempt == 2:
-                    raise RuntimeError(f"Elsevier request failed ({type(exc).__name__}).") from None
-            else:
-                if response.status_code < 400:
-                    return response
-                error = self._error(response)
-                exhausted = (response.headers.get("X-RateLimit-Remaining") == "0"
-                             or "QUOTA_EXCEEDED" in response.headers.get("X-ELS-Status", "").upper())
-                if response.status_code not in {429, 500, 502, 503, 504} or exhausted or attempt == 2:
-                    raise error
-                delay = self._retry_delay(response.headers.get("Retry-After", ""), delay)
-                if delay > 60:
-                    raise error  # Do not retry earlier than a long server-requested delay.
-            time.sleep(delay)
-        raise RuntimeError("Elsevier request attempts exhausted.")
+        authenticated = bool(client.headers.get("X-ELS-APIKey"))
+        origin = self.BASE_URL if authenticated else url
+        headers = {"Accept": accept}
+        if authenticated:
+            headers["X-ELS-APIKey"] = self.api_key
+            if self.inst_token:
+                headers["X-ELS-Insttoken"] = self.inst_token
+        try:
+            return ProviderHTTP("Elsevier", origin, headers=headers).get(
+                client, url, RequestAllowance(remaining=3, wait_seconds=60),
+                params=params, allow_redirect_response=True)
+        except RequestFailure as exc:
+            if exc.error.status_code:
+                raise ScopusAPIError(exc.error.status_code, exc.error.message) from None
+            raise
 
     @staticmethod
     def _json(response: httpx.Response, envelope: str) -> dict:
@@ -144,7 +105,7 @@ class ScopusSearcher(PaperSource):
                    for author in _items(item.get("author")) if isinstance(author, (dict, str))]
         date = item.get("prism:coverDate") or ""
         try:
-            published_date = datetime.fromisoformat(f"{date}-01-01" if len(date) == 4 else date)
+            published_date = datetime.fromisoformat(f"{date}-01-01" if len(date) == 4 else f"{date}-01" if len(date) == 7 else date)
         except (TypeError, ValueError):
             published_date = None
         try:
@@ -159,9 +120,85 @@ class ScopusSearcher(PaperSource):
             abstract=item.get("dc:description") or "", doi=doi, published_date=published_date,
             pdf_url="", url=url or (f"https://doi.org/{doi}" if doi else item.get("prism:url") or ""),
             source="scopus", citations=citations,
+            extra={"venue": item.get("prism:publicationName") or ""},
             categories=[subject["@abbrev"] for subject in _items(item.get("subject-area"))
                         if isinstance(subject, dict) and subject.get("@abbrev")],
         )
+
+    def search_page(self, query: SavedQuery, continuation=None, *, allowance=None) -> ProviderPage:
+        if query.source != "scopus" or query.mode != "native_query" or set(query.filters) - {"date", "field"}:
+            raise ValueError("Unsupported Scopus query options.")
+        if not query.query.strip():
+            raise ValueError("Scopus query must not be empty.")
+        state = continuation or {"cursor": "*", "received": 0}
+        cursor_mode = "cursor" in state
+        start = state.get("received", 0) if cursor_mode else state.get("start")
+        if (cursor_mode and (set(state) != {"cursor", "received"} or not isinstance(state["cursor"], str) or not state["cursor"])) or type(start) is not int or start < 0:
+            raise ValueError("Invalid Scopus continuation.")
+        field = query.filters.get("field")
+        params = {"query": f"{field}({query.query})" if field else query.query,
+                  "view": "COMPLETE", "sort": (query.sort or "relevance").replace("relevance", "relevancy"),
+                  "count": min(25, query.page_size)}
+        params.update({"cursor": state["cursor"]} if cursor_mode else {"start": start})
+        if date := query.filters.get("date"):
+            params["date"] = self._normalize_date_range(date)
+        headers = {"X-ELS-APIKey": self.api_key}
+        if self.inst_token:
+            headers["X-ELS-Insttoken"] = self.inst_token
+        http = ProviderHTTP("Elsevier", self.BASE_URL, headers=headers)
+        allowance = allowance if allowance is not None else RequestAllowance()
+        before = allowance.used
+        page = ProviderPage(continuation=state)
+        try:
+            with httpx.Client() as client:
+                data = self._json(http.get(client, f"{self.BASE_URL}/search/scopus", allowance, params=params), "search-results")
+            total = int(data["opensearch:totalResults"])
+            page.total = ReportedTotal(value=total, precision="exact")
+            entries = data.get("entry", [])
+            if isinstance(entries, dict):
+                entries = [entries]
+            if not isinstance(entries, list) or (total and not entries):
+                raise ValueError("Invalid result entries")
+            for entry in entries:
+                if total == 0 and isinstance(entry, dict) and entry.get("error") == "Result set was empty":
+                    continue
+                clean = sanitize(entry, (self.api_key, self.inst_token))
+                try:
+                    record = Metadata.from_paper(self._parse_paper(clean))
+                    record.venue = record.extra.get("venue", "")
+                    date = clean.get("prism:coverDate", "")
+                    if date:
+                        record.published_date = date
+                        record.date_precision = {4: "year", 7: "month"}.get(len(date), "day")
+                    identifiers(record)
+                    validate_date(record.published_date, record.date_precision)
+                    page.records.append(record)
+                except (ValueError, TypeError, KeyError, AttributeError, RuntimeError):
+                    page.rejected.append(RejectedRecord(raw=clean, reason="Invalid Scopus record (identifier, title or metadata)."))
+            more = start + len(entries) < total
+            if cursor_mode and more:
+                cursor = data.get("cursor", {}).get("@next")
+                if not isinstance(cursor, str) or not cursor:
+                    raise ValueError("Missing cursor")
+                if cursor == state["cursor"]:
+                    page.error = ProviderError(kind="nonadvancing", message="Scopus cursor did not advance.")
+                    page.state = "failed"
+                else:
+                    page.continuation = {"cursor": cursor, "received": start + len(entries)}
+            else:
+                page.continuation = {"start": start + len(entries)} if more else None
+            if not page.error:
+                page.state = "ready" if page.continuation else "exhausted"
+        except RequestFailure as exc:
+            page.error = exc.error
+            if exc.error.status_code == 403:
+                page.error.message += " Check institutional network/VPN or SCOPUS_INST_TOKEN entitlement."
+            page.state = "budget" if exc.error.kind == "budget" else "waiting" if exc.error.retry_at else "failed"
+        except (ValueError, TypeError, KeyError, AttributeError, RuntimeError):
+            page.error = ProviderError(kind="malformed_response", message="Elsevier returned an invalid search-results response.")
+            page.state = "failed"
+        page.requests_used = allowance.used - before
+        return page
 
     def search(self, query: str, max_results: int = 10, sort: str = "relevance",
                field: str | None = None, date: str | None = None) -> list[Paper]:
@@ -169,32 +206,25 @@ class ScopusSearcher(PaperSource):
             return []
         if not query.strip():
             raise ValueError("Scopus query must not be empty.")
-        params = {"query": f"{field}({query})" if field else query, "view": "COMPLETE",
-                  "sort": sort.replace("relevance", "relevancy")}
-        if date:
-            params["date"] = self._normalize_date_range(date)
-        start = 0
-        papers: dict[str, Paper] = {}
-        with self._client() as client:
-            while len(papers) < max_results:
-                data = self._json(self._request(client, f"{self.BASE_URL}/search/scopus", params={
-                    **params, "start": start, "count": min(25, max_results - len(papers)),
-                }), "search-results")
-                if "entry" not in data and str(data.get("opensearch:totalResults")) != "0":
-                    raise RuntimeError("Scopus search response is missing result entries.")
-                entries = _items(data.get("entry"))
-                previous_count = len(papers)
-                for entry in entries:
-                    if isinstance(entry, dict) and entry.get("error") == "Result set was empty":
-                        continue
-                    paper = self._parse_paper(entry)
-                    papers.setdefault(paper.paper_id, paper)
-                    if len(papers) == max_results:
-                        break
-                start += len(entries)
-                if len(papers) == previous_count or start >= int(data.get("opensearch:totalResults", start)):
-                    break
-        return list(papers.values())
+        filters = {key: value for key, value in {"field": field, "date": date}.items() if value}
+        papers = {}
+        continuation = {"start": 0}
+        while len(papers) < max_results:
+            page = self.search_page(SavedQuery(source="scopus", query=query, sort=sort, filters=filters,
+                page_size=min(25, max_results - len(papers))), continuation,
+                allowance=RequestAllowance(remaining=3, wait_seconds=60))
+            for record in page.records:
+                papers.setdefault(record.paper_id, record.to_paper())
+            if page.rejected:
+                raise RuntimeError(page.rejected[0].reason)
+            if page.error:
+                if page.error.status_code:
+                    raise ScopusAPIError(page.error.status_code, page.error.message)
+                raise RequestFailure(page.error)
+            if page.state == "exhausted":
+                break
+            continuation = page.continuation
+        return list(papers.values())[:max_results]
 
     @staticmethod
     def _full_text(response: httpx.Response) -> str:

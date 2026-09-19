@@ -5,64 +5,44 @@ import os
 import logging
 import re
 import httpx
-from mcp.server.fastmcp import FastMCP
-from .config import get_env
-from .academic_platforms.arxiv import ArxivSearcher
-from .academic_platforms.pubmed import PubMedSearcher
-from .academic_platforms.biorxiv import BioRxivSearcher
-from .academic_platforms.medrxiv import MedRxivSearcher
-from .academic_platforms.google_scholar import GoogleScholarSearcher
-from .academic_platforms.scopus import ScopusSearcher
-from .academic_platforms.iacr import IACRSearcher
-from .academic_platforms.semantic import SemanticSearcher
-from .academic_platforms.crossref import CrossRefSearcher
-from .academic_platforms.openalex import OpenAlexSearcher
-from .academic_platforms.pmc import PMCSearcher
-from .academic_platforms.core import CORESearcher
-from .academic_platforms.europepmc import EuropePMCSearcher
-from .academic_platforms.sci_hub import SciHubFetcher
-from .academic_platforms.dblp import DBLPSearcher
-from .academic_platforms.openaire import OpenAiresearcher
-from .academic_platforms.citeseerx import CiteSeerXSearcher
-from .academic_platforms.doaj import DOAJSearcher
-from .academic_platforms.base_search import BASESearcher
-from .academic_platforms.unpaywall import UnpaywallResolver, UnpaywallSearcher
-from .academic_platforms.zenodo import ZenodoSearcher
-from .academic_platforms.hal import HALSearcher
-from .academic_platforms.ssrn import SSRNSearcher
+from mcp.server.mcpserver import MCPServer
+from .registry import (
+    SOURCES, SourceInfo, available_sources, list_sources as describe_sources,
+    provider, unpaywall_fallback,
+)
+from .academic_platforms.sci_hub import SciHubFetcher  # Legacy import/patch compatibility.
 from .utils import extract_doi
+from .library_models import ResolutionRequest, PublicationView, ReviewPage, DuplicateSuggestions, ResolutionResult
 
 # from .academic_platforms.hub import SciHubSearcher
 from .paper import Paper
 
 # Initialize MCP server
-mcp = FastMCP("paper_search_server")
+mcp = MCPServer("paper_search_server")
 logger = logging.getLogger(__name__)
 
-# Instances of searchers
-arxiv_searcher = ArxivSearcher()
-pubmed_searcher = PubMedSearcher()
-biorxiv_searcher = BioRxivSearcher()
-medrxiv_searcher = MedRxivSearcher()
-iacr_searcher = IACRSearcher()
-semantic_searcher = SemanticSearcher()
-crossref_searcher = CrossRefSearcher()
-openalex_searcher = OpenAlexSearcher()
-pmc_searcher = PMCSearcher()
-core_searcher = CORESearcher()
-europepmc_searcher = EuropePMCSearcher()
-dblp_searcher = DBLPSearcher()
-openaire_searcher = OpenAiresearcher()
-citeseerx_searcher = CiteSeerXSearcher()
-doaj_searcher = DOAJSearcher()
-base_searcher = BASESearcher()
-unpaywall_resolver = UnpaywallResolver()
-unpaywall_searcher = UnpaywallSearcher(resolver=unpaywall_resolver)
-zenodo_searcher = ZenodoSearcher()
-hal_searcher = HALSearcher()
-ssrn_searcher = SSRNSearcher()
-# scihub_searcher = SciHubSearcher()
-
+# Lazy compatibility handles; provider definitions live only in registry.py.
+arxiv_searcher = provider("arxiv")
+pubmed_searcher = provider("pubmed")
+biorxiv_searcher = provider("biorxiv")
+medrxiv_searcher = provider("medrxiv")
+iacr_searcher = provider("iacr")
+semantic_searcher = provider("semantic")
+crossref_searcher = provider("crossref")
+openalex_searcher = provider("openalex")
+pmc_searcher = provider("pmc")
+core_searcher = provider("core")
+europepmc_searcher = provider("europepmc")
+dblp_searcher = provider("dblp")
+openaire_searcher = provider("openaire")
+citeseerx_searcher = provider("citeseerx")
+doaj_searcher = provider("doaj")
+base_searcher = provider("base")
+zenodo_searcher = provider("zenodo")
+hal_searcher = provider("hal")
+ssrn_searcher = provider("ssrn")
+unpaywall_resolver = unpaywall_fallback()
+unpaywall_searcher = provider("unpaywall", resolver=unpaywall_resolver)
 
 # Asynchronous helper to adapt synchronous searchers
 # Runs blocking requests-based calls in a thread pool to avoid blocking the event loop.
@@ -76,63 +56,102 @@ async def async_search(searcher, query: str, max_results: int, **kwargs) -> List
     return [paper.to_dict() for paper in papers]
 
 
-ALL_SOURCES = [
-    "arxiv",
-    "pubmed",
-    "biorxiv",
-    "medrxiv",
-    "iacr",
-    "semantic",
-    "crossref",
-    "openalex",
-    "pmc",
-    "core",
-    "europepmc",
-    "dblp",
-    "openaire",
-    "citeseerx",
-    "doaj",
-    "base",
-    "zenodo",
-    "hal",
-    "ssrn",
-    "unpaywall",
-]
+ALL_SOURCES = available_sources()
+
+# Preserve conditional legacy tools, including explicit errors for configured stubs.
+ieee_searcher = provider("ieee") if SOURCES["ieee"].describe().configured else None
+acm_searcher = provider("acm") if SOURCES["acm"].describe().configured else None
+google_scholar_searcher = provider("google_scholar") if "google_scholar" in ALL_SOURCES else None
+scopus_searcher = provider("scopus") if "scopus" in ALL_SOURCES else None
 
 
-# ---------------------------------------------------------------------------
-# Optional paid-platform connectors (disabled by default)
-# Set PAPER_SEARCH_MCP_IEEE_API_KEY / PAPER_SEARCH_MCP_ACM_API_KEY to activate
-# (legacy IEEE_API_KEY / ACM_API_KEY are also supported).
-# ---------------------------------------------------------------------------
-_ieee_api_key = get_env("IEEE_API_KEY", "")
-_acm_api_key = get_env("ACM_API_KEY", "")
+@mcp.tool()
+async def list_sources() -> list[SourceInfo]:
+    """List every source's configuration, implementation, capabilities and limitations.
 
-if _ieee_api_key:
-    from .academic_platforms.ieee import IEEESearcher
-    ieee_searcher = IEEESearcher()
-    ALL_SOURCES.append("ieee")
-    logger.info("IEEE Xplore enabled via configured environment key.")
-else:
-    ieee_searcher = None
-
-if _acm_api_key:
-    from .academic_platforms.acm import ACMSearcher
-    acm_searcher = ACMSearcher()
-    ALL_SOURCES.append("acm")
-    logger.info("ACM Digital Library enabled via configured environment key.")
-else:
-    acm_searcher = None
+    Access is unverified: configured credentials do not establish entitlement.
+    This operation makes no provider requests.
+    """
+    return describe_sources()
 
 
-_serpapi_key = get_env("SERPAPI_API_KEY").strip()
-_scopus_key = get_env("SCOPUS_API_KEY").strip()
-google_scholar_searcher = GoogleScholarSearcher(api_key=_serpapi_key) if _serpapi_key else None
-scopus_searcher = ScopusSearcher(api_key=_scopus_key) if _scopus_key else None
-ALL_SOURCES.extend(name for name, searcher in (
-    ("google_scholar", google_scholar_searcher), ("scopus", scopus_searcher),
-) if searcher is not None)
 
+from .review_models import (ReviewProtocol, SearchRequest, ReviewCreated, ReviewUpdated, ReviewView,
+                            ReviewList, SearchStarted, RunView)
+from .reviews import Reviews
+
+
+@mcp.tool()
+async def create_review(protocol: ReviewProtocol, idempotency_key: str) -> ReviewCreated:
+    """Save a review protocol and report unsupported or unavailable sources."""
+    return await asyncio.to_thread(lambda: Reviews().create_review(protocol, idempotency_key=idempotency_key))
+
+
+@mcp.tool()
+async def update_review(review_id: str, protocol: ReviewProtocol, idempotency_key: str) -> ReviewUpdated:
+    """Save a new protocol revision without changing existing search specifications."""
+    return await asyncio.to_thread(lambda: Reviews().update_review(review_id, protocol, idempotency_key=idempotency_key))
+
+
+@mcp.tool()
+async def get_review(review_id: str) -> ReviewView:
+    """Read the saved protocol and its revision history."""
+    return await asyncio.to_thread(lambda: Reviews().get_review(review_id))
+
+
+@mcp.tool()
+async def list_reviews(limit: int = 20, after: str | None = None) -> ReviewList:
+    """List reviews with bounded display pagination."""
+    return await asyncio.to_thread(lambda: Reviews().list_reviews(limit=limit, after=after))
+
+
+@mcp.tool()
+async def start_search(request: SearchRequest, idempotency_key: str) -> SearchStarted:
+    """Freeze native queries and explicit request budgets; makes no provider requests."""
+    return await asyncio.to_thread(lambda: Reviews().start_search(request, idempotency_key=idempotency_key))
+
+
+@mcp.tool()
+async def advance_run(run_id: str, idempotency_key: str, max_requests: int = 4) -> RunView:
+    """Advance a saved search by at most four HTTP attempts, including retries."""
+    return await asyncio.to_thread(lambda: Reviews().advance_run(run_id, idempotency_key=idempotency_key, max_requests=max_requests))
+
+
+@mcp.tool()
+async def get_run(run_id: str) -> RunView:
+    """Read immutable search specifications, budgets, checkpoints and source outcomes."""
+    return await asyncio.to_thread(lambda: Reviews().get_run(run_id))
+
+
+@mcp.tool()
+async def get_paper(publication_id: str) -> PublicationView:
+    """Read persisted metadata, conflicting alternatives, source observations and query hits."""
+    from .library import Library
+    return await asyncio.to_thread(lambda: Library().get_paper(publication_id))
+
+
+@mcp.tool()
+async def query_review(review_id: str, limit: int = 20, after: str | None = None) -> ReviewPage:
+    """Page through persisted review publications (20 by default; maximum 100)."""
+    from .library import Library
+    return await asyncio.to_thread(lambda: Library().query_review(review_id, limit=limit, after=after))
+
+
+@mcp.tool()
+async def possible_duplicates(publication_id: str, limit: int = 20) -> DuplicateSuggestions:
+    """Suggest similar publications for human review; never merge automatically."""
+    from .library import Library
+    return await asyncio.to_thread(lambda: Library().possible_duplicates(publication_id, limit=limit))
+
+
+@mcp.tool()
+async def resolve_publications(request: ResolutionRequest, idempotency_key: str) -> ResolutionResult:
+    """Apply an explicit manual merge, separation, metadata override, relationship or undo.
+
+    Record the human actor and reason. Use a unique idempotency key per operation.
+    """
+    from .library import Library
+    return await asyncio.to_thread(lambda: Library().resolve_publications(request, idempotency_key=idempotency_key))
 
 def _parse_sources(sources: str) -> List[str]:
     if not sources or sources.strip().lower() == "all":
@@ -142,7 +161,7 @@ def _parse_sources(sources: str) -> List[str]:
     return [source for source in normalized if source in ALL_SOURCES]
 
 
-def _paper_unique_key(paper: Dict[str, Any]) -> str:
+def _paper_unique_key(paper: dict[str, Any]) -> str:
     doi = (paper.get("doi") or "").strip().lower()
     if doi:
         return f"doi:{doi}"
@@ -156,8 +175,8 @@ def _paper_unique_key(paper: Dict[str, Any]) -> str:
     return f"id:{paper_id}"
 
 
-def _dedupe_papers(papers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    deduped: List[Dict[str, Any]] = []
+def _dedupe_papers(papers: List[dict[str, Any]]) -> List[dict[str, Any]]:
+    deduped: List[dict[str, Any]] = []
     seen: set[str] = set()
 
     for paper in papers:
@@ -253,19 +272,20 @@ async def search_papers(
     max_results_per_source: int = 5,
     sources: str = "all",
     year: Optional[str] = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Unified top-level search across all configured academic platforms.
 
     Args:
         query: Search query string.
         max_results_per_source: Max results to fetch from each selected source.
         sources: Comma-separated source names or 'all'.
-            Available: arxiv,pubmed,biorxiv,medrxiv,iacr,semantic,crossref,openalex,pmc,core,europepmc,dblp,openaire,citeseerx,doaj,base,zenodo,hal,ssrn,unpaywall.
-            With configured keys: google_scholar (SerpAPI), scopus, ieee, acm.
+            Use list_sources for capabilities and configuration requirements.
+            Unavailable sources and stubs are excluded from aggregate discovery.
             'all' includes configured Google Scholar and consumes SerpAPI searches.
         year: Optional year filter for Semantic Scholar only.
     Returns:
         Aggregated dictionary with per-source stats, errors, and deduplicated papers.
+        total counts retrieved, deduplicated results, not upstream matches.
     """
     selected_sources = _parse_sources(sources)
 
@@ -282,64 +302,22 @@ async def search_papers(
 
     task_map = {}
     for source in selected_sources:
-        if source == "arxiv":
-            task_map[source] = search_arxiv(query, max_results_per_source)
-        elif source == "pubmed":
-            task_map[source] = search_pubmed(query, max_results_per_source)
-        elif source == "biorxiv":
-            task_map[source] = search_biorxiv(query, max_results_per_source)
-        elif source == "medrxiv":
-            task_map[source] = search_medrxiv(query, max_results_per_source)
-        elif source == "google_scholar":
-            task_map[source] = search_google_scholar(query, max_results_per_source)
-        elif source == "iacr":
-            task_map[source] = search_iacr(query, max_results_per_source, fetch_details=False)
-        elif source == "semantic":
-            task_map[source] = search_semantic(query, year=year, max_results=max_results_per_source)
-        elif source == "crossref":
-            task_map[source] = search_crossref(query, max_results=max_results_per_source)
-        elif source == "openalex":
-            task_map[source] = search_openalex(query, max_results_per_source)
-        elif source == "pmc":
-            task_map[source] = search_pmc(query, max_results_per_source)
-        elif source == "core":
-            task_map[source] = search_core(query, max_results_per_source)
-        elif source == "europepmc":
-            task_map[source] = search_europepmc(query, max_results_per_source)
-        elif source == "dblp":
-            task_map[source] = search_dblp(query, max_results_per_source)
-        elif source == "openaire":
-            task_map[source] = search_openaire(query, max_results_per_source)
-        elif source == "citeseerx":
-            task_map[source] = search_citeseerx(query, max_results_per_source)
-        elif source == "doaj":
-            task_map[source] = search_doaj(query, max_results_per_source)
-        elif source == "base":
-            task_map[source] = search_base(query, max_results_per_source)
-        elif source == "zenodo":
-            task_map[source] = search_zenodo(query, max_results_per_source)
-        elif source == "hal":
-            task_map[source] = search_hal(query, max_results_per_source)
-        elif source == "ssrn":
-            task_map[source] = search_ssrn(query, max_results_per_source)
-        elif source == "unpaywall":
-            task_map[source] = search_unpaywall(query, max_results_per_source)
-        elif source == "ieee":
-            if ieee_searcher is not None:
-                task_map[source] = async_search(ieee_searcher, query, max_results_per_source)
-        elif source == "acm":
-            if acm_searcher is not None:
-                task_map[source] = async_search(acm_searcher, query, max_results_per_source)
-        elif source == "scopus":
-            if scopus_searcher is not None:
-                task_map[source] = async_search(scopus_searcher, query, max_results_per_source)
+        extra = {"year": year} if source == "semantic" else {}
+        if source == "iacr":
+            extra["fetch_details"] = False
+        if source == "scopus":
+            task_map[source] = async_search(scopus_searcher, query, max_results_per_source)
+            continue
+        task_map[source] = globals()[f"search_{source}"](
+            query, max_results=max_results_per_source, **extra,
+        )
 
     source_names = list(task_map.keys())
     source_outputs = await asyncio.gather(*task_map.values(), return_exceptions=True)
 
     source_results: Dict[str, int] = {}
     errors: Dict[str, str] = {}
-    merged_papers: List[Dict[str, Any]] = []
+    merged_papers: List[dict[str, Any]] = []
 
     for source_name, output in zip(source_names, source_outputs):
         if isinstance(output, Exception):
@@ -552,7 +530,7 @@ async def read_arxiv_paper(paper_id: str, save_path: str = "./downloads") -> str
     try:
         return arxiv_searcher.read_paper(paper_id, save_path)
     except Exception as e:
-        print(f"Error reading paper {paper_id}: {e}")
+        logger.error("Error reading paper %s (%s)", paper_id, type(e).__name__)
         return ""
 
 
@@ -582,7 +560,7 @@ async def read_biorxiv_paper(paper_id: str, save_path: str = "./downloads") -> s
     try:
         return biorxiv_searcher.read_paper(paper_id, save_path)
     except Exception as e:
-        print(f"Error reading paper {paper_id}: {e}")
+        logger.error("Error reading paper %s (%s)", paper_id, type(e).__name__)
         return ""
 
 
@@ -599,7 +577,7 @@ async def read_medrxiv_paper(paper_id: str, save_path: str = "./downloads") -> s
     try:
         return medrxiv_searcher.read_paper(paper_id, save_path)
     except Exception as e:
-        print(f"Error reading paper {paper_id}: {e}")
+        logger.error("Error reading paper %s (%s)", paper_id, type(e).__name__)
         return ""
 
 
@@ -616,7 +594,7 @@ async def read_iacr_paper(paper_id: str, save_path: str = "./downloads") -> str:
     try:
         return iacr_searcher.read_paper(paper_id, save_path)
     except Exception as e:
-        print(f"Error reading paper {paper_id}: {e}")
+        logger.error("Error reading paper %s (%s)", paper_id, type(e).__name__)
         return ""
 
 
@@ -680,7 +658,7 @@ async def read_semantic_paper(paper_id: str, save_path: str = "./downloads") -> 
     try:
         return semantic_searcher.read_paper(paper_id, save_path)
     except Exception as e:
-        print(f"Error reading paper {paper_id}: {e}")
+        logger.error("Error reading paper %s (%s)", paper_id, type(e).__name__)
         return ""
 
 
@@ -701,9 +679,9 @@ async def search_crossref(
 
     Args:
         query: Search query string (e.g., 'machine learning', 'climate change').
-        max_results: Maximum number of papers to return (default: 10, max: 1000).
+        max_results: Maximum number of papers to return (default: 10).
         filter: CrossRef filter string (e.g., 'has-full-text:true,from-pub-date:2020').
-        sort: Sort field ('relevance', 'published', 'updated', 'deposited', etc.).
+        sort: Cursor-compatible sort, such as 'relevance', 'created', 'updated' or 'deposited'. Publication-date sorts are unsupported.
         order: Sort order ('asc' or 'desc').
     Returns:
         List of paper metadata in dictionary format.
@@ -764,7 +742,7 @@ async def download_scihub(
     Returns:
         Downloaded PDF path on success; error message on failure.
     """
-    fetcher = SciHubFetcher(base_url=base_url, output_dir=save_path)
+    fetcher = SOURCES["scihub"].create(base_url=base_url, output_dir=save_path)
     result = await asyncio.to_thread(fetcher.download_pdf, identifier)
     if result:
         return result
@@ -797,31 +775,15 @@ async def download_with_fallback(
     source_name = source.strip().lower()
 
     primary_downloaders = {
-        "arxiv": arxiv_searcher.download_pdf,
-        "biorxiv": biorxiv_searcher.download_pdf,
-        "medrxiv": medrxiv_searcher.download_pdf,
-        "iacr": iacr_searcher.download_pdf,
-        "semantic": semantic_searcher.download_pdf,
-        "pubmed": pubmed_searcher.download_pdf,
-        "crossref": crossref_searcher.download_pdf,
-        "pmc": pmc_searcher.download_pdf,
-        "core": core_searcher.download_pdf,
-        "europepmc": europepmc_searcher.download_pdf,
-        "citeseerx": citeseerx_searcher.download_pdf,
-        "doaj": doaj_searcher.download_pdf,
-        "base": base_searcher.download_pdf,
-        "zenodo": zenodo_searcher.download_pdf,
-        "hal": hal_searcher.download_pdf,
-        "ssrn": ssrn_searcher.download_pdf,
+        name: globals().get(f"{name}_searcher")
+        for name in SOURCES if name in ALL_SOURCES
     }
-    if scopus_searcher is not None:
-        primary_downloaders["scopus"] = scopus_searcher.download_pdf
 
     attempt_errors: List[str] = []
     primary_error = ""
     if source_name in primary_downloaders:
         try:
-            primary_result = await asyncio.to_thread(primary_downloaders[source_name], paper_id, save_path)
+            primary_result = await asyncio.to_thread(primary_downloaders[source_name].download_pdf, paper_id, save_path)
             if isinstance(primary_result, str) and os.path.exists(primary_result):
                 return primary_result
             if isinstance(primary_result, str) and primary_result:
@@ -858,7 +820,7 @@ async def download_with_fallback(
         return "Download failed after OA fallback chain. Details: " + " | ".join(attempt_errors)
 
     fallback_identifier = (doi or "").strip() or (title or "").strip() or paper_id
-    fetcher = SciHubFetcher(base_url=scihub_base_url, output_dir=save_path)
+    fetcher = SOURCES["scihub"].create(base_url=scihub_base_url, output_dir=save_path)
     fallback_result = await asyncio.to_thread(fetcher.download_pdf, fallback_identifier)
     if fallback_result:
         return fallback_result
@@ -1320,7 +1282,7 @@ async def download_openalex(paper_id: str, save_path: str = "./downloads") -> st
 if ieee_searcher is not None:
     @mcp.tool()
     async def search_ieee(query: str, max_results: int = 10) -> List[Dict]:
-        """Search IEEE Xplore for papers.  Requires PAPER_SEARCH_MCP_IEEE_API_KEY (or IEEE_API_KEY).
+        """Unimplemented IEEE search stub; always reports an error. Requires PAPER_SEARCH_MCP_IEEE_API_KEY (or IEEE_API_KEY).
 
         Args:
             query: Search query string.
@@ -1361,7 +1323,7 @@ if ieee_searcher is not None:
 if acm_searcher is not None:
     @mcp.tool()
     async def search_acm(query: str, max_results: int = 10) -> List[Dict]:
-        """Search ACM Digital Library for papers.  Requires PAPER_SEARCH_MCP_ACM_API_KEY (or ACM_API_KEY).
+        """Unimplemented ACM search stub; always reports an error. Requires PAPER_SEARCH_MCP_ACM_API_KEY (or ACM_API_KEY).
 
         Args:
             query: Search query string.

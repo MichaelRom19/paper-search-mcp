@@ -19,6 +19,12 @@ class PaperSource(ABC):
             List of Paper objects.
         """
 
+    def search_page(self, query, continuation=None, *, allowance=None):
+        """Adapters opt in; legacy search cannot imply resumable page support."""
+        from ..provider_models import ProviderError, ProviderPage
+        return ProviderPage(state="failed", error=ProviderError(
+            kind="unsupported", message="Provider page operation is not implemented."))
+
     def download_pdf(self, paper_id: str, save_path: str) -> str:
         """Download the PDF for a given paper.
 

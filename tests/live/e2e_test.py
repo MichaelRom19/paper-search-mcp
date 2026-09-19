@@ -1,11 +1,17 @@
 """
 End-to-end tests: search → download → read content for every supported platform.
-Run with: python tests/e2e_test.py
+Run with: python tests/live/e2e_test.py --live
 """
+import argparse
+
+parser = argparse.ArgumentParser(description="Live provider checks (may consume API quota)")
+parser.add_argument("--live", action="store_true", required=True, help="Allow live provider requests")
+parser.parse_args()
+
 import sys
 import os
 import time
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from paper_search_mcp.config import get_env
 

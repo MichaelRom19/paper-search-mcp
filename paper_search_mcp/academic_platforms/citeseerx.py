@@ -6,7 +6,6 @@ import logging
 import json
 import xml.etree.ElementTree as ET
 from urllib.parse import quote, urlencode
-from requests.exceptions import SSLError
 import urllib3
 
 from ..paper import Paper
@@ -43,15 +42,9 @@ class CiteSeerXSearcher(PaperSource):
             self.session.headers.update({'Authorization': f'Bearer {self.api_key}'})
 
     def _get(self, url: str, **kwargs) -> requests.Response:
-        """GET wrapper with SSL fallback and archive-redirect detection."""
+        """GET wrapper with certificate verification and archive-redirect detection."""
         kwargs.setdefault('timeout', 30)
-        try:
-            resp = self.session.get(url, **kwargs)
-        except SSLError:
-            logger.warning("CiteSeerX SSL verification failed; retrying without cert verification")
-            kwargs['verify'] = False
-            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-            resp = self.session.get(url, **kwargs)
+        resp = self.session.get(url, **kwargs)
 
         # If the endpoint redirected to the Wayback Machine the original host
         # is no longer serving live API responses; treat this as unavailable.

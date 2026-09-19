@@ -1,21 +1,7 @@
-"""ACM Digital Library connector — optional, requires API key env.
+"""ACM Digital Library stub. All operations are unimplemented, with or without a key.
 
-This module is a **skeleton only**.  No real ACM DL API requests are made
-unless the ``PAPER_SEARCH_MCP_ACM_API_KEY`` (or legacy ``ACM_API_KEY``)
-environment variable is configured.  All methods
-raise :class:`NotImplementedError` with a descriptive message when accessed
-without a valid key so that the rest of the platform continues to work without
-any paid credentials.
-
-Enable usage::
-
-    export PAPER_SEARCH_MCP_ACM_API_KEY=<your_acm_api_key>
-
-.. note::
-    ACM recently opened a limited metadata API.  Check
-    https://libraries.acm.org/digital-library/acm-open for Open Access content
-    that does NOT require a key.  Full-text/PDF download requires ACM membership
-    or institutional access.
+The environment key records configuration only. Legacy MCP tools may be
+registered when it is present; this source is never aggregate discovery.
 """
 
 from __future__ import annotations
@@ -30,32 +16,24 @@ from ..config import get_env
 logger = logging.getLogger(__name__)
 
 _NOT_CONFIGURED_MSG = (
-    "ACM Digital Library is not configured.  Set PAPER_SEARCH_MCP_ACM_API_KEY "
-    "(or legacy ACM_API_KEY) environment "
-    "variable to enable ACM DL search.  "
-    "See https://libraries.acm.org/digital-library/acm-open for access options."
+    "ACM Digital Library is an unimplemented stub. PAPER_SEARCH_MCP_ACM_API_KEY "
+    "(or ACM_API_KEY) records configuration only; it does not enable operations. "
+    "Use browser search until this adapter is implemented."
 )
 
 
 class ACMSearcher(PaperSource):
-    """Skeleton connector for ACM Digital Library.
-
-    Instantiating this class without ``PAPER_SEARCH_MCP_ACM_API_KEY``
-    (or ``ACM_API_KEY``) set will log a warning
-    but will NOT raise an error.  All actual operations raise
-    :class:`NotImplementedError` with a clear message directing the user to
-    configure their API key.
-    """
+    """Unimplemented ACM Digital Library connector; key presence only indicates configuration."""
 
     # ACM DL base URL (placeholder — real endpoint TBD once API key is available)
     BASE_URL = "https://dl.acm.org/action/doSearch"
 
     def __init__(self) -> None:
-        self.api_key: str = get_env("ACM_API_KEY", "")
+        self.api_key: str = get_env("ACM_API_KEY", "").strip()
         if not self.api_key:
             logger.warning(
                 "ACMSearcher initialised without PAPER_SEARCH_MCP_ACM_API_KEY/ACM_API_KEY.  "
-                "All calls will raise NotImplementedError until the key is set."
+                "All calls raise NotImplementedError, even when a key is set."
             )
 
     # ------------------------------------------------------------------
@@ -82,7 +60,7 @@ class ACMSearcher(PaperSource):
         # TODO: implement real ACM DL API call here once key is available
         raise NotImplementedError(
             "ACM DL search is not yet implemented.  "
-            "Contribute at https://github.com/your-repo/paper-search-mcp."
+            "Contribute at https://github.com/openags/paper-search-mcp."
         )
 
     def download_pdf(self, paper_id: str, save_path: str = "./downloads") -> str:

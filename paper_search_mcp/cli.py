@@ -9,79 +9,16 @@ import json
 import sys
 from typing import Any, Dict, List
 
-from .config import get_env
-from .academic_platforms.arxiv import ArxivSearcher
-from .academic_platforms.pubmed import PubMedSearcher
-from .academic_platforms.biorxiv import BioRxivSearcher
-from .academic_platforms.medrxiv import MedRxivSearcher
-from .academic_platforms.google_scholar import GoogleScholarSearcher
-from .academic_platforms.scopus import ScopusSearcher
-from .academic_platforms.iacr import IACRSearcher
-from .academic_platforms.semantic import SemanticSearcher
-from .academic_platforms.crossref import CrossRefSearcher
-from .academic_platforms.openalex import OpenAlexSearcher
-from .academic_platforms.pmc import PMCSearcher
-from .academic_platforms.core import CORESearcher
-from .academic_platforms.europepmc import EuropePMCSearcher
-from .academic_platforms.dblp import DBLPSearcher
-from .academic_platforms.openaire import OpenAiresearcher
-from .academic_platforms.citeseerx import CiteSeerXSearcher
-from .academic_platforms.doaj import DOAJSearcher
-from .academic_platforms.base_search import BASESearcher
-from .academic_platforms.unpaywall import UnpaywallResolver, UnpaywallSearcher
-from .academic_platforms.zenodo import ZenodoSearcher
-from .academic_platforms.hal import HALSearcher
-from .academic_platforms.ssrn import SSRNSearcher
+from .registry import available_sources, list_sources, provider
 
-# ---------------------------------------------------------------------------
-# Searcher registry
-# ---------------------------------------------------------------------------
 
-SEARCHERS: Dict[str, Any] = {}
+SEARCHERS: dict[str, Any] = {}
 
 
 def _init_searchers() -> None:
-    """Lazily initialize searcher instances."""
-    if SEARCHERS:
-        return
-
-    SEARCHERS["arxiv"] = ArxivSearcher()
-    SEARCHERS["pubmed"] = PubMedSearcher()
-    SEARCHERS["biorxiv"] = BioRxivSearcher()
-    SEARCHERS["medrxiv"] = MedRxivSearcher()
-    SEARCHERS["iacr"] = IACRSearcher()
-    SEARCHERS["semantic"] = SemanticSearcher()
-    SEARCHERS["crossref"] = CrossRefSearcher()
-    SEARCHERS["openalex"] = OpenAlexSearcher()
-    SEARCHERS["pmc"] = PMCSearcher()
-    SEARCHERS["core"] = CORESearcher()
-    SEARCHERS["europepmc"] = EuropePMCSearcher()
-    SEARCHERS["dblp"] = DBLPSearcher()
-    SEARCHERS["openaire"] = OpenAiresearcher()
-    SEARCHERS["citeseerx"] = CiteSeerXSearcher()
-    SEARCHERS["doaj"] = DOAJSearcher()
-    SEARCHERS["base"] = BASESearcher()
-    unpaywall_resolver = UnpaywallResolver()
-    SEARCHERS["unpaywall"] = UnpaywallSearcher(resolver=unpaywall_resolver)
-    SEARCHERS["zenodo"] = ZenodoSearcher()
-    SEARCHERS["hal"] = HALSearcher()
-    SEARCHERS["ssrn"] = SSRNSearcher()
-
-    if key := get_env("SERPAPI_API_KEY").strip():
-        SEARCHERS["google_scholar"] = GoogleScholarSearcher(api_key=key)
-    if key := get_env("SCOPUS_API_KEY").strip():
-        SEARCHERS["scopus"] = ScopusSearcher(api_key=key)
-
-    # Optional paid connectors
-    ieee_key = get_env("IEEE_API_KEY", "")
-    if ieee_key:
-        from .academic_platforms.ieee import IEEESearcher
-        SEARCHERS["ieee"] = IEEESearcher()
-
-    acm_key = get_env("ACM_API_KEY", "")
-    if acm_key:
-        from .academic_platforms.acm import ACMSearcher
-        SEARCHERS["acm"] = ACMSearcher()
+    """Create lazy handles for configured, implemented registry entries."""
+    if not SEARCHERS:
+        SEARCHERS.update((name, provider(name)) for name in available_sources())
 
 
 def _parse_sources(sources: str) -> List[str]:
@@ -213,9 +150,60 @@ async def cmd_read(args: argparse.Namespace) -> int:
 
 
 async def cmd_sources(args: argparse.Namespace) -> int:
-    _init_searchers()
-    print(json.dumps({"sources": sorted(SEARCHERS.keys())}, indent=2))
+    if args.details:
+        print(json.dumps([source.model_dump() for source in list_sources()], indent=2))
+    else:
+        print(json.dumps({"sources": sorted(available_sources())}, indent=2))
     return 0
+
+
+async def cmd_review(args: argparse.Namespace) -> int:
+    from pathlib import Path
+    from .reviews import Reviews
+    from .review_models import ReviewProtocol, SearchRequest
+    try:
+        service = Reviews()
+        command = args.command.replace("-", "_")
+        if command in {"create_review", "update_review", "start_search"}:
+            model = SearchRequest if command == "start_search" else ReviewProtocol
+            request = model.model_validate_json(Path(args.request_file).read_text())
+            positional = [args.review_id, request] if command == "update_review" else [request]
+            result = getattr(service, command)(*positional, idempotency_key=args.idempotency_key)
+        elif command == "advance_run":
+            result = service.advance_run(args.run_id, idempotency_key=args.idempotency_key, max_requests=args.max_requests)
+        elif command == "list_reviews":
+            result = service.list_reviews(limit=args.limit, after=args.after)
+        else:
+            result = getattr(service, command)(args.review_id if command == "get_review" else args.run_id)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    except (ValueError, OSError) as exc:
+        print(json.dumps({"error": str(exc)}), file=sys.stderr)
+        return 1
+
+
+async def cmd_library(args: argparse.Namespace) -> int:
+    from pathlib import Path
+    from pydantic import TypeAdapter
+    from .library import Library
+    from .library_models import ResolutionRequest
+
+    try:
+        library = Library()
+        if args.command == "resolve-publications":
+            request = TypeAdapter(ResolutionRequest).validate_json(Path(args.request_file).read_text())
+            result = library.resolve_publications(request, idempotency_key=args.idempotency_key)
+        elif args.command == "get-paper":
+            result = library.get_paper(args.publication_id)
+        elif args.command == "possible-duplicates":
+            result = library.possible_duplicates(args.publication_id, limit=args.limit)
+        else:
+            result = library.query_review(args.review_id, limit=args.limit, after=args.after)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    except (ValueError, OSError) as exc:
+        print(json.dumps({"error": str(exc)}), file=sys.stderr)
+        return 1
 
 
 # ---------------------------------------------------------------------------
@@ -251,8 +239,37 @@ def build_parser() -> argparse.ArgumentParser:
     p_read.add_argument("-o", "--save-path", default="./downloads", help="Save directory (default: ./downloads)")
 
     # sources
-    sub.add_parser("sources", help="List available sources")
+    p_sources = sub.add_parser("sources", help="List available sources")
+    p_sources.add_argument("--details", action="store_true", help="Include every source and its capabilities")
+    sub.add_parser("list-sources", help="List all source capabilities").set_defaults(details=True)
 
+    for command in ("get-paper", "possible-duplicates"):
+        subparser = sub.add_parser(command, help="Inspect the persistent library")
+        subparser.add_argument("publication_id")
+        if command == "possible-duplicates":
+            subparser.add_argument("--limit", type=int, default=20)
+    query = sub.add_parser("query-review", help="List persisted review publications")
+    query.add_argument("review_id")
+    query.add_argument("--limit", type=int, default=20)
+    query.add_argument("--after")
+    resolution = sub.add_parser("resolve-publications", help="Apply a typed manual resolution from a JSON file")
+    resolution.add_argument("request_file")
+    resolution.add_argument("--idempotency-key", required=True)
+    for command in ("create-review", "update-review", "start-search", "advance-run", "get-run", "get-review", "list-reviews"):
+        item = sub.add_parser(command, help="Saved review protocols and resumable searches")
+        if command in {"update-review", "get-review"}:
+            item.add_argument("review_id")
+        if command in {"advance-run", "get-run"}:
+            item.add_argument("run_id")
+        if command in {"create-review", "update-review", "start-search"}:
+            item.add_argument("request_file")
+        if command in {"create-review", "update-review", "start-search", "advance-run"}:
+            item.add_argument("--idempotency-key", required=True)
+        if command == "advance-run":
+            item.add_argument("--max-requests", type=int, default=4)
+        if command == "list-reviews":
+            item.add_argument("--limit", type=int, default=20)
+            item.add_argument("--after")
     return parser
 
 
@@ -261,13 +278,18 @@ def main() -> None:
     args = parser.parse_args()
 
     dispatch = {
+        "get-paper": cmd_library,
+        "query-review": cmd_library,
+        "possible-duplicates": cmd_library,
+        "resolve-publications": cmd_library,
         "search": cmd_search,
         "download": cmd_download,
         "read": cmd_read,
         "sources": cmd_sources,
+        "list-sources": cmd_sources,
     }
 
-    exit_code = asyncio.run(dispatch[args.command](args))
+    exit_code = asyncio.run(dispatch.get(args.command, cmd_review)(args))
     sys.exit(exit_code)
 
 

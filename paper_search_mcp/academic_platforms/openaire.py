@@ -6,7 +6,6 @@ import logging
 import xml.etree.ElementTree as ET
 import urllib3
 import time
-from requests.exceptions import SSLError
 
 from ..paper import Paper
 from ..utils import extract_doi
@@ -150,13 +149,7 @@ class OpenAiresearcher(PaperSource):
 
     def _get(self, url: str, **kwargs) -> requests.Response:
         kwargs.setdefault('timeout', 30)
-        try:
-            return self.session.get(url, **kwargs)
-        except SSLError:
-            logger.warning("OpenAIRE SSL verification failed; retrying without cert verification")
-            kwargs['verify'] = False
-            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-            return self.session.get(url, **kwargs)
+        return self.session.get(url, **kwargs)
 
     def _find_top_level_results(self, root: ET.Element) -> List[ET.Element]:
         for element in root.iter():

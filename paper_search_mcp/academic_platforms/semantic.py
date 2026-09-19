@@ -2,8 +2,6 @@ from typing import List, Optional
 from datetime import datetime
 import os
 import requests
-from bs4 import BeautifulSoup
-import time
 import random
 from ..paper import Paper
 from ..utils import extract_doi
@@ -11,7 +9,11 @@ from .base import PaperSource
 import logging
 from pypdf import PdfReader
 import re
+import httpx
 from ..config import get_env
+from ..discovery import collect, fetch_page, semantic_mode
+from ..http import ProviderHTTP, RequestAllowance
+from ..provider_models import Author, Metadata, ProviderError, ReportedTotal, SavedQuery
 
 logger = logging.getLogger(__name__)
 
@@ -27,8 +29,13 @@ class SemanticSearcher(PaperSource):
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
     ]
 
-    def __init__(self):
+    SEARCH_FIELDS = "title,abstract,year,citationCount,authors,url,publicationDate,externalIds,fieldsOfStudy,openAccessPdf,venue"
+
+    def __init__(self, api_key=None):
         self._setup_session()
+        key = (get_env("SEMANTIC_SCHOLAR_API_KEY") if api_key is None else api_key).strip()
+        self.http = ProviderHTTP("Semantic Scholar", self.SEMANTIC_BASE_URL,
+                                 headers={"x-api-key": key} if key else {})
 
     def _setup_session(self):
         """Initialize session with random user agent"""
@@ -158,203 +165,101 @@ class SemanticSearcher(PaperSource):
             return None
         return api_key.strip()
 
-    def request_api(self, path: str, params: dict) -> dict:
-        """
-        Make a request to the Semantic Scholar API with optional API key.
-        """
-        max_retries = 3
-        api_key = self.get_api_key()
-        retry_delay = 5 if api_key is None else 2
-        has_retried_without_key = False
+    def request_api(self, endpoint, params=None):
+        with httpx.Client() as client:
+            return self.http.get(client, f"{self.SEMANTIC_BASE_URL}/{endpoint}", RequestAllowance(), params=params)
 
-        for attempt in range(max_retries):
-            try:
-                headers = {"x-api-key": api_key} if api_key else {}
-                url = f"{self.SEMANTIC_BASE_URL}/{path}"
-                response = self.session.get(
-                    url, params=params, headers=headers, timeout=30
-                )
+    def page_request(self, query, continuation):
+        from ..registry import SOURCES
+        source = SOURCES["semantic"]
+        if (query.source != "semantic" or query.mode not in source.query_modes or
+                set(query.filters) - {"year"} or query.sort is not None and query.sort not in source.sorts):
+            raise ValueError("Unsupported Semantic Scholar query options.")
+        if not query.query.strip():
+            raise ValueError("Native query must not be blank.")
+        relevance = semantic_mode(query) == "relevance"
+        params = {"query": query.query, "fields": self.SEARCH_FIELDS, **query.filters}
+        state = continuation or {}
+        received = state.get("received", 0)
+        if type(received) is not int or received < 0 or set(state) - {"cursor", "received"}:
+            raise ValueError("Invalid Semantic Scholar continuation.")
+        if relevance:
+            offset = state.get("cursor", 0)
+            if type(offset) is not int or not 0 <= offset < 1000:
+                raise ValueError("Invalid relevance offset.")
+            params.update(offset=offset, limit=min(query.page_size, 1000 - offset))
+        else:
+            if state:
+                if not isinstance(state.get("cursor"), str) or not state["cursor"]:
+                    raise ValueError("Invalid bulk continuation.")
+                params["token"] = state["cursor"]
+            if query.sort:
+                params["sort"] = query.sort
+        return self.SEMANTIC_SEARCH_URL + ("" if relevance else "/bulk"), params
 
-                if (
-                    response.status_code == 403
-                    and api_key
-                    and not has_retried_without_key
-                ):
-                    logger.warning(
-                        "Semantic Scholar API key was rejected (403). Retrying without API key."
-                    )
-                    api_key = None
-                    has_retried_without_key = True
-                    continue
+    @staticmethod
+    def page_entries(data):
+        if not isinstance(data["data"], list) or "error" in data:
+            raise ValueError("Invalid result envelope")
+        return data["data"]
 
-                # 检查是否是429错误（限流）
-                if response.status_code == 429:
-                    if attempt < max_retries - 1:
-                        retry_after = response.headers.get("Retry-After")
-                        wait_time = (
-                            int(retry_after)
-                            if retry_after and retry_after.isdigit()
-                            else retry_delay * (2**attempt)
-                        )
-                        logger.warning(
-                            f"Rate limited (429). Waiting {wait_time} seconds before retry {attempt + 1}/{max_retries}"
-                        )
-                        time.sleep(wait_time)
-                        continue
-                    else:
-                        logger.error(
-                            f"Rate limited (429) after {max_retries} attempts. Please wait before making more requests."
-                        )
-                        return {
-                            "error": "rate_limited",
-                            "status_code": 429,
-                            "message": "Too many requests. Please wait before retrying.",
-                        }
+    @staticmethod
+    def page_response(data, response, query, continuation, page):
+        entries = data["data"]
+        if not isinstance(entries, list) or "error" in data:
+            raise ValueError("Invalid result envelope")
+        relevance = query.mode == "relevance" or query.sort == "relevance"
+        page.total = ReportedTotal(value=data.get("total"), precision="estimated" if data.get("total") is not None else "unknown")
+        cursor = data.get("next" if relevance else "token")
+        invalid_cursor = (type(cursor) is not int or cursor < 0) if relevance else (not isinstance(cursor, str) or not cursor)
+        if cursor is not None and invalid_cursor:
+            raise ValueError("Invalid continuation")
+        received = (continuation or {}).get("received", 0) + len(entries)
+        page.continuation = {"cursor": cursor, "received": received} if cursor is not None else None
+        page.state = "ready" if page.continuation else "exhausted"
+        if relevance:
+            offset = (continuation or {}).get("cursor", 0)
+            if cursor is not None and cursor <= offset:
+                page.state = "failed"
+                page.error = ProviderError(kind="nonadvancing", message="Semantic Scholar offset did not advance.")
+            if (cursor is not None and cursor >= 1000 or offset + len(entries) >= 1000 and
+                    (page.total.value is None or page.total.value > 1000)):
+                page.state = "provider_cap"
+            page.warnings = ["Relevance discovery is limited to 1,000 results."]
+        else:
+            page.warnings = ["Bulk search returns up to 1,000 records per request; page_size is not supported upstream. Retrieval ceiling: 10,000,000 records."]
+            if cursor is not None and cursor == (continuation or {}).get("cursor"):
+                page.state = "failed"
+                page.error = ProviderError(kind="nonadvancing", message="Semantic Scholar token did not advance.")
+            elif cursor is not None and received >= 10_000_000:
+                page.state = "provider_cap"
+        return entries
 
-                response.raise_for_status()
-                return response
+    @staticmethod
+    def metadata(item):
+        external = item.get("externalIds") or {}
+        namespaces = {"DOI": "doi", "ArXiv": "arxiv", "PubMed": "pmid", "PubMedCentral": "pmcid",
+                      "CorpusId": "corpusid", "MAG": "mag", "DBLP": "dblp", "ACL": "acl"}
+        date = item.get("publicationDate") or str(item.get("year") or "") or None
+        return Metadata(paper_id=item["paperId"], source="semantic", title=item["title"],
+            authors=[Author(name=a["name"]) for a in item.get("authors") or [] if a.get("name")],
+            abstract=item.get("abstract") or "", doi=external.get("DOI") or "",
+            identifiers={namespaces.get(key, key.lower()): str(value) for key, value in external.items() if value},
+            published_date=date, date_precision={4: "year", 7: "month", 10: "day"}.get(len(date or ""), "unknown"),
+            url=item.get("url") or "", pdf_url=(item.get("openAccessPdf") or {}).get("url") or "",
+            venue=item.get("venue") or "", citations=item.get("citationCount") or 0,
+            categories=item.get("fieldsOfStudy") or [], extra={"external_ids": external})
 
-            except requests.exceptions.HTTPError as e:
-                if (
-                    e.response.status_code == 403
-                    and api_key
-                    and not has_retried_without_key
-                ):
-                    logger.warning(
-                        "Semantic Scholar API key was rejected (403). Retrying without API key."
-                    )
-                    api_key = None
-                    has_retried_without_key = True
-                    continue
-                if e.response.status_code == 429:
-                    if attempt < max_retries - 1:
-                        retry_after = e.response.headers.get("Retry-After")
-                        wait_time = (
-                            int(retry_after)
-                            if retry_after and retry_after.isdigit()
-                            else retry_delay * (2**attempt)
-                        )
-                        logger.warning(
-                            f"Rate limited (429). Waiting {wait_time} seconds before retry {attempt + 1}/{max_retries}"
-                        )
-                        time.sleep(wait_time)
-                        continue
-                    else:
-                        logger.error(
-                            f"Rate limited (429) after {max_retries} attempts. Please wait before making more requests."
-                        )
-                        return {
-                            "error": "rate_limited",
-                            "status_code": 429,
-                            "message": "Too many requests. Please wait before retrying.",
-                        }
-                else:
-                    logger.error(f"HTTP Error requesting API: {e}")
-                    return {
-                        "error": "http_error",
-                        "status_code": e.response.status_code,
-                        "message": str(e),
-                    }
-            except Exception as e:
-                logger.error(f"Error requesting API: {e}")
-                return {"error": "general_error", "message": str(e)}
+    def search_page(self, query, continuation=None, *, allowance=None):
+        return fetch_page(self, query, continuation, allowance)
 
-        return {
-            "error": "max_retries_exceeded",
-            "message": "Maximum retry attempts exceeded",
-        }
-
-    def search(
-        self,
-        query: str,
-        year: Optional[str] = None,
-        max_results: int = 10,
-        fetch_details: bool = False,
-    ) -> List[Paper]:
-        """
-        Search Semantic Scholar
-
-        Args:
-            query: Search query string
-            year (Optional[str]): Filter by publication year. Supports several formats:
-            - Single year: "2019"
-            - Year range: "2016-2020"
-            - Since year: "2010-"
-            - Until year: "-2015"
-            max_results: Maximum number of results to return
-            fetch_details: Backward-compatible flag retained for older callers.
-                Semantic search responses already include the fields this connector uses,
-                so the current implementation does not perform extra per-paper detail fetches.
-
-        Returns:
-            List[Paper]: List of paper objects
-        """
-        papers = []
-
-        try:
-            fields = [
-                "title",
-                "abstract",
-                "year",
-                "citationCount",
-                "authors",
-                "url",
-                "publicationDate",
-                "externalIds",
-                "fieldsOfStudy",
-                "openAccessPdf",
-            ]
-            # Construct search parameters
-            params = {
-                "query": query,
-                "limit": max_results,
-                "fields": ",".join(fields),
-            }
-            if year:
-                params["year"] = year
-            # Make request
-            response = self.request_api("paper/search", params)
-
-            # Check for errors
-            if isinstance(response, dict) and "error" in response:
-                error_msg = response.get("message", "Unknown error")
-                if response.get("error") == "rate_limited":
-                    logger.error(f"Rate limited by Semantic Scholar API: {error_msg}")
-                else:
-                    logger.error(f"Semantic Scholar API error: {error_msg}")
-                return papers
-
-            # Check response status code
-            if not hasattr(response, "status_code") or response.status_code != 200:
-                status_code = getattr(response, "status_code", "unknown")
-                logger.error(
-                    f"Semantic Scholar search failed with status {status_code}"
-                )
-                return papers
-
-            data = response.json()
-            results = data["data"]
-
-            if not results:
-                logger.info("No results found for the query")
-                return papers
-
-            # Process each result
-            for i, item in enumerate(results):
-                if len(papers) >= max_results:
-                    break
-
-                logger.info(
-                    f"Processing paper {i + 1}/{min(len(results), max_results)}"
-                )
-                paper = self._parse_paper(item)
-                if paper:
-                    papers.append(paper)
-
-        except Exception as e:
-            logger.error(f"Semantic Scholar search error: {e}")
-
-        return papers[:max_results]
+    def search(self, query: str, year: Optional[str] = None, max_results: int = 10, fetch_details: bool = False) -> List[Paper]:
+        """Bounded relevance discovery; fetch_details remains a compatibility no-op."""
+        if max_results <= 0:
+            return []
+        saved = SavedQuery(source="semantic", query=query, mode="relevance", page_size=min(max_results, 100),
+                           filters={"year": year} if year else {})
+        return collect(self, saved, max_results)
 
     def download_pdf(self, paper_id: str, save_path: str) -> str:
         """
@@ -526,7 +431,7 @@ class SemanticSearcher(PaperSource):
                 return None
 
             results = response.json()
-            paper = self._parse_paper(results)
+            paper = self.metadata(results).to_paper()
             if paper:
                 return paper
             else:

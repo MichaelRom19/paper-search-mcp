@@ -1,15 +1,7 @@
-"""IEEE Xplore connector — optional, requires API key env.
+"""IEEE Xplore stub. All operations are unimplemented, with or without a key.
 
-This module is a **skeleton only**.  No real IEEE Xplore API requests are made
-unless the ``PAPER_SEARCH_MCP_IEEE_API_KEY`` (or legacy ``IEEE_API_KEY``)
-environment variable is configured.  All methods
-raise :class:`NotImplementedError` with a descriptive message when accessed
-without a valid key so that the rest of the platform continues to work without
-any paid credentials.
-
-Enable usage::
-
-    export PAPER_SEARCH_MCP_IEEE_API_KEY=<your_ieee_api_key>
+The environment key records configuration only. Legacy MCP tools may be
+registered when it is present; this source is never aggregate discovery.
 """
 
 from __future__ import annotations
@@ -24,32 +16,24 @@ from ..config import get_env
 logger = logging.getLogger(__name__)
 
 _NOT_CONFIGURED_MSG = (
-    "IEEE Xplore is not configured.  Set PAPER_SEARCH_MCP_IEEE_API_KEY "
-    "(or legacy IEEE_API_KEY) environment variable "
-    "to enable IEEE Xplore search and download.  "
-    "Obtain a free API key at https://developer.ieee.org/."
+    "IEEE Xplore is an unimplemented stub. PAPER_SEARCH_MCP_IEEE_API_KEY "
+    "(or IEEE_API_KEY) records configuration only; it does not enable operations. "
+    "Use browser search until this adapter is implemented."
 )
 
 
 class IEEESearcher(PaperSource):
-    """Skeleton connector for IEEE Xplore.
-
-    Instantiating this class without ``PAPER_SEARCH_MCP_IEEE_API_KEY``
-    (or ``IEEE_API_KEY``) set will log a warning
-    but will NOT raise an error.  All actual operations will raise
-    :class:`NotImplementedError` with a clear message directing the user to
-    configure their API key.
-    """
+    """Unimplemented IEEE Xplore connector; key presence only indicates configuration."""
 
     # Base URL for IEEE Xplore REST API (v1)
     BASE_URL = "https://ieeexploreapi.ieee.org/api/v1/search/articles"
 
     def __init__(self) -> None:
-        self.api_key: str = get_env("IEEE_API_KEY", "")
+        self.api_key: str = get_env("IEEE_API_KEY", "").strip()
         if not self.api_key:
             logger.warning(
                 "IEEESearcher initialised without PAPER_SEARCH_MCP_IEEE_API_KEY/IEEE_API_KEY.  "
-                "All calls will raise NotImplementedError until the key is set."
+                "All calls raise NotImplementedError, even when a key is set."
             )
 
     # ------------------------------------------------------------------
@@ -76,7 +60,7 @@ class IEEESearcher(PaperSource):
         # TODO: implement real IEEE Xplore REST call here once key is available
         raise NotImplementedError(
             "IEEE Xplore search is not yet implemented.  "
-            "Contribute at https://github.com/your-repo/paper-search-mcp."
+            "Contribute at https://github.com/openags/paper-search-mcp."
         )
 
     def download_pdf(self, paper_id: str, save_path: str = "./downloads") -> str:
